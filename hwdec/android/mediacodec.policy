@@ -1,0 +1,6 @@
+
+# Appended to the image's policy by build.sh.  The OMX.waydroid decoders
+# reach waydroid-hwdec through a Unix socket, and 32-bit bionic makes socket
+# calls through socketcall: socket (1), connect (3), setsockopt (14) and
+# recvmsg (17).
+socketcall: arg0 == 1 || arg0 == 3 || arg0 == 14 || arg0 == 17

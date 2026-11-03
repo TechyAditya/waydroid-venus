@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- Decoders that run on the host GPU through waydroid-hwdec.  build.sh
+     includes this file from media_codecs_waydroid.xml, a copy of the image's
+     media_codecs.xml that ro.media.xml_variant.codecs=_waydroid selects.
+     OMX codecs outside OMX.google rank ahead of the software codecs, so these
+     are preferred.  The limits are NVDEC's on Turing and newer GPUs; 8-bit
+     only. -->
+<Included>
+    <Decoders>
+        <MediaCodec name="OMX.waydroid.avc.decoder" type="video/avc">
+            <Limit name="size" min="16x16" max="4096x4096" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="block-count" range="1-65536" />
+            <Limit name="blocks-per-second" range="1-3932160" />
+            <Limit name="bitrate" range="1-240000000" />
+            <Limit name="concurrent-instances" max="16" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+        <MediaCodec name="OMX.waydroid.hevc.decoder" type="video/hevc">
+            <Limit name="size" min="16x16" max="8192x8192" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="block-count" range="1-262144" />
+            <Limit name="blocks-per-second" range="1-4177920" />
+            <Limit name="bitrate" range="1-240000000" />
+            <Limit name="concurrent-instances" max="16" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+        <MediaCodec name="OMX.waydroid.vp8.decoder" type="video/x-vnd.on2.vp8">
+            <Limit name="size" min="16x16" max="4096x4096" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="block-count" range="1-65536" />
+            <Limit name="blocks-per-second" range="1-3932160" />
+            <Limit name="bitrate" range="1-120000000" />
+            <Limit name="concurrent-instances" max="16" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+        <MediaCodec name="OMX.waydroid.vp9.decoder" type="video/x-vnd.on2.vp9">
+            <Limit name="size" min="16x16" max="8192x8192" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="block-count" range="1-262144" />
+            <Limit name="blocks-per-second" range="1-4177920" />
+            <Limit name="bitrate" range="1-240000000" />
+            <Limit name="concurrent-instances" max="16" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+        <MediaCodec name="OMX.waydroid.av1.decoder" type="video/av01">
+            <Limit name="size" min="16x16" max="8192x8192" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="block-count" range="1-262144" />
+            <Limit name="blocks-per-second" range="1-4177920" />
+            <Limit name="bitrate" range="1-240000000" />
+            <Limit name="concurrent-instances" max="16" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+    </Decoders>
+</Included>

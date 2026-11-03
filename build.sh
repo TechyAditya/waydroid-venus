@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Builds the patched render server for the host, and the patched Venus
-# Vulkan driver and gralloc for Waydroid's Android 13 x86_64 image.
+# Builds the patched render server and the video decoder for the host, and
+# the patched Venus Vulkan driver, gralloc and OMX video decoders for
+# Waydroid's Android 13 x86_64 image.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -14,6 +15,11 @@ host_out=$build/host
 mesa_commit=60e95b787857afbc9a00b693b91c0d9c8923a430
 virgl_commit=ca50e008863837e094747a69974dde3ae148aeaa
 libhardware_commit=bbd07bd2e60752a665ebc9b0915241f3c1636516
+# LineageOS 20, which Waydroid's Android 13 image is built from
+lineage_av_commit=673733ea38f2fae2552b43ff0b01338c6393b5d2
+lineage_native_commit=915ad642e331e0f8ea107b5f5519f2c6f1e7e01c
+lineage_core_commit=c0500ffe2cc283d61f1e3db1b2c979bfbd9beb8c
+lineage_logging_commit=373d54e772f303c441faf2e584a2edf3601b4181
 ndk_version=r28c
 android_api=33
 
@@ -43,12 +49,42 @@ fetch() {
    mv "$tmp" "$dir"
 }
 
+# Checks out PATHS of LineageOS repository REPO at COMMIT into
+# build/lineage/REPO, for headers only.
+fetch_headers() {
+   local repo=$1 commit=$2 dir=$build/lineage/$1
+   shift 2
+   if [ -d "$dir" ]; then
+      if [ "$(git -C "$dir" rev-parse HEAD)" != "$commit" ] || ! git -C "$dir" diff --quiet HEAD; then
+         echo "$dir is not a clean checkout of $commit; remove it to rebuild" >&2
+         exit 1
+      fi
+      return
+   fi
+
+   local tmp=$dir.tmp
+   rm -rf "$tmp"
+   git init -q "$tmp"
+   git -C "$tmp" remote add origin "https://github.com/LineageOS/android_$repo"
+   git -C "$tmp" sparse-checkout set --no-cone "$@"
+   git -C "$tmp" fetch -q --depth 1 --filter=blob:none origin "$commit"
+   git -C "$tmp" checkout -q FETCH_HEAD
+   mv "$tmp" "$dir"
+}
+
 fetch https://gitlab.freedesktop.org/virgl/virglrenderer.git "$virgl_commit" \
    "$build/virglrenderer" "$here/patches/virglrenderer-vtest-import-fd.patch"
 fetch https://gitlab.freedesktop.org/mesa/mesa.git "$mesa_commit" \
    "$build/mesa" "$here/patches/mesa-venus-vtest-android.patch"
 fetch https://android.googlesource.com/platform/hardware/libhardware "$libhardware_commit" \
    "$build/libhardware" "$here/patches/gralloc-waydroid-venus.patch"
+fetch_headers frameworks_av "$lineage_av_commit" \
+   media/libstagefright/omx/include media/libstagefright/foundation/include
+fetch_headers frameworks_native "$lineage_native_commit" \
+   headers/media_plugin libs/nativewindow/include libs/nativebase/include libs/arect/include
+fetch_headers system_core "$lineage_core_commit" \
+   libutils/include libcutils/include libsystem/include
+fetch_headers system_logging "$lineage_logging_commit" liblog/include
 
 ndk=${ANDROID_NDK:-$build/android-ndk-$ndk_version}
 if [ ! -f "$ndk/source.properties" ]; then
@@ -71,6 +107,12 @@ rm -rf "$host_out" "$host_out.tmp"
 DESTDIR="$host_out.tmp" ninja -C "$build/virglrenderer/build" install
 mv "$host_out.tmp$prefix" "$host_out"
 rm -rf "$host_out.tmp"
+
+# It parses bitstreams from Android apps, so build it hardened.
+cc -O2 -Wall -Wextra -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fstack-clash-protection \
+   -fPIE -pie -Wl,-z,relro,-z,now -pthread \
+   -o "$host_out/bin/waydroid-hwdec" "$here/hwdec/host/waydroid-hwdec.c" \
+   $(pkg-config --cflags --libs libavcodec libavutil libswscale)
 
 ndk_bin=$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin
 gralloc_src=$build/libhardware/modules/gralloc
@@ -129,5 +171,59 @@ EOF
    "$ndk_bin/llvm-strip" "$build/out/$lib/gralloc.default.so"
 done
 
+# The OMX video decoders.  The codec service that loads them is 32-bit only.
+# They link against the image's own libraries, which debugfs reads from the
+# images without mounting them, and the image's codec list and seccomp
+# policy are extended rather than replaced.
+images=$(sed -n 's/^images_path *= *//p' /var/lib/waydroid/waydroid.cfg 2> /dev/null)
+images=${WAYDROID_IMAGES:-${images:-/var/lib/waydroid/images}}
+image_files=$build/waydroid-image
+rm -rf "$image_files"
+mkdir -p "$image_files/lib"
+# Copies PATH from the ext4 IMAGE to DEST.
+extract() {
+   local image=$1 path=$2 dest=$3
+   debugfs -R "dump $path $dest" "$image" > /dev/null 2>&1 || true
+   if [ ! -s "$dest" ]; then
+      echo "cannot read $path from $image" >&2
+      exit 1
+   fi
+}
+for name in libstagefright_foundation libutils libcutils liblog; do
+   extract "$images/system.img" "/system/lib/$name.so" "$image_files/lib/$name.so"
+done
+extract "$images/vendor.img" /lib/libstagefright_softomx.so "$image_files/lib/libstagefright_softomx.so"
+extract "$images/vendor.img" /etc/media_codecs.xml "$image_files/media_codecs.xml"
+extract "$images/vendor.img" /etc/seccomp_policy/mediacodec.policy "$image_files/mediacodec.policy"
+
+lineage=$build/lineage
+"$ndk_bin/i686-linux-android$android_api-clang++" -shared -fPIC -O2 -std=gnu++17 \
+   -fno-rtti -fno-exceptions -static-libstdc++ -Wall -Wno-unused-parameter \
+   -I"$lineage/frameworks_av/media/libstagefright/omx/include" \
+   -I"$lineage/frameworks_av/media/libstagefright/foundation/include" \
+   -I"$lineage/frameworks_native/headers/media_plugin" \
+   -I"$lineage/frameworks_native/headers/media_plugin/media/openmax" \
+   -I"$lineage/frameworks_native/libs/nativewindow/include" \
+   -I"$lineage/frameworks_native/libs/nativebase/include" \
+   -I"$lineage/frameworks_native/libs/arect/include" \
+   -I"$lineage/system_core/libutils/include" -I"$lineage/system_core/libcutils/include" \
+   -I"$lineage/system_core/libsystem/include" -I"$lineage/system_logging/liblog/include" \
+   -o "$build/out/lib/libstagefrighthw.so" "$here/hwdec/android/WaydroidDecoder.cpp" \
+   -L"$image_files/lib" -lstagefright_softomx -lstagefright_foundation -lutils -lcutils -llog \
+   -Wl,--no-undefined
+"$ndk_bin/llvm-strip" "$build/out/lib/libstagefrighthw.so"
+
+mkdir -p "$build/out/etc/seccomp_policy"
+cp "$here/hwdec/android/media_codecs_waydroid_hwdec.xml" "$build/out/etc/"
+sed 's|^</MediaCodecs>|    <Include href="media_codecs_waydroid_hwdec.xml" />\n&|' \
+   "$image_files/media_codecs.xml" > "$build/out/etc/media_codecs_waydroid.xml"
+if [ "$(grep -c media_codecs_waydroid_hwdec "$build/out/etc/media_codecs_waydroid.xml")" != 1 ]; then
+   echo "unexpected $images/vendor.img:/etc/media_codecs.xml" >&2
+   exit 1
+fi
+cat "$image_files/mediacodec.policy" "$here/hwdec/android/mediacodec.policy" \
+   > "$build/out/etc/seccomp_policy/mediacodec.policy"
+
 echo "render server: $host_out/bin/virgl_test_server"
-echo "android libraries: $build/out/lib64 $build/out/lib"
+echo "video decoder: $host_out/bin/waydroid-hwdec"
+echo "android files: $build/out"

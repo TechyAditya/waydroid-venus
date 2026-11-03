@@ -1,0 +1,57 @@
+[Unit]
+Description=Video decoder for Waydroid (Android video decoding on the host GPU)
+Before=waydroid-container.service
+
+[Service]
+User=waydroid-hwdec
+Group=waydroid-hwdec
+Environment=HOME=/var/cache/waydroid-hwdec
+Environment=__GL_SHADER_DISK_CACHE_PATH=/var/cache/waydroid-hwdec
+CacheDirectory=waydroid-hwdec
+# The socket directory belongs to the Waydroid user; see waydroid-venus.service.
+ExecStartPre=+/bin/sh -c '[ -d "$1" ] || install -d -o "$2" -g "$2" -m 0755 "$1"' sh @SOCKET_DIR@ @USER@
+ExecStartPre=+/usr/bin/setfacl -m u:waydroid-hwdec:rwx @SOCKET_DIR@
+ExecStartPre=+/usr/bin/rm -f @SOCKET_DIR@/hwdec.sock
+# Only Android's codec service (AID_MEDIA_CODEC) may connect.
+ExecStart=@PREFIX@/bin/waydroid-hwdec --socket-path @SOCKET_DIR@/hwdec.sock --allowed-uid 1046
+Restart=always
+RestartSec=1
+
+# Every Android app can make the decoder parse bitstreams of its choosing, so
+# contain it like the render server.
+ProtectHome=tmpfs
+BindPaths=@SOCKET_DIR@
+InaccessiblePaths=-/run/dbus
+ProtectSystem=strict
+PrivateTmp=yes
+PrivateNetwork=yes
+PrivateIPC=yes
+DevicePolicy=closed
+DeviceAllow=char-nvidia rw
+DeviceAllow=char-nvidiactl rw
+DeviceAllow=char-nvidia-uvm rw
+DeviceAllow=char-drm rw
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+UMask=0077
+TasksMax=256
+MemoryMax=4G
+
+[Install]
+WantedBy=multi-user.target

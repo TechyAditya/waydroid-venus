@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Run with sudo.  Restores Waydroid's software rendering and removes the
-# render server service.  Restarts a running Waydroid container.  Safe to
-# run again after a failure: the property backup is removed last.
+# Run with sudo.  Restores Waydroid's software rendering and video decoding
+# and removes the render server and video decoder services.  Restarts a
+# running Waydroid container.  Safe to run again after a failure: the
+# property backup is removed last.
 set -euo pipefail
 
 user=${SUDO_USER:?run with sudo}
@@ -12,6 +13,8 @@ cfg=/var/lib/waydroid/waydroid.cfg
 backup=/var/lib/waydroid/waydroid-venus-properties.json
 unit=/etc/systemd/system/waydroid-venus.service
 sysusers=/etc/sysusers.d/waydroid-venus.conf
+hwdec_unit=/etc/systemd/system/waydroid-hwdec.service
+hwdec_sysusers=/etc/sysusers.d/waydroid-hwdec.conf
 socket_dir=$home/.local/share/waydroid/data/venus
 legacy_unit=$home/.config/systemd/user/waydroid-venus.service
 
@@ -23,6 +26,7 @@ props = {
     "ro.hardware.vulkan": "virtio",
     "mesa.vn.debug": "vtest",
     "mesa.vtest.socket.name": "/data/venus/vtest.sock",
+    "ro.media.xml_variant.codecs": "_waydroid",
 }
 if os.path.exists(backup_path):
     with open(backup_path) as f:
@@ -37,7 +41,11 @@ if cfg.has_section("properties"):
         if previous is None:
             if cfg["properties"].get(key) == value:
                 cfg.remove_option("properties", key)
-        elif previous.get(key) is None:
+        elif key not in previous:
+            # added after the backup was made
+            if cfg["properties"].get(key) == value:
+                cfg.remove_option("properties", key)
+        elif previous[key] is None:
             cfg.remove_option("properties", key)
         else:
             cfg["properties"][key] = previous[key]
@@ -49,19 +57,25 @@ for lib in lib64 lib; do
    rm -f "$overlay/$lib/hw/vulkan.virtio.so" "$overlay/$lib/hw/gralloc.default.so"
 done
 rm -f "$overlay/bin/waydroid-venus-recover.sh" "$overlay/etc/init/waydroid-venus.rc"
+rm -f "$overlay/lib/libstagefrighthw.so" "$overlay/etc/media_codecs_waydroid.xml" \
+   "$overlay/etc/media_codecs_waydroid_hwdec.xml" "$overlay/etc/seccomp_policy/mediacodec.policy"
 waydroid upgrade --offline
 
-systemctl disable --now waydroid-venus.service 2> /dev/null || true
-rm -f "$unit"
+systemctl disable --now waydroid-venus.service waydroid-hwdec.service 2> /dev/null || true
+rm -f "$unit" "$hwdec_unit"
 systemctl daemon-reload
 # the directory is shared with other services' sockets
-rm -f "$socket_dir/vtest.sock"
-setfacl -x u:waydroid-venus "$socket_dir" 2> /dev/null || true
-rm -rf "$prefix" /var/cache/waydroid-venus
-rm -f "$sysusers"
-if getent passwd waydroid-venus > /dev/null; then
-   userdel waydroid-venus
-fi
+rm -f "$socket_dir/vtest.sock" "$socket_dir/hwdec.sock"
+for account in waydroid-venus waydroid-hwdec; do
+   setfacl -x "u:$account" "$socket_dir" 2> /dev/null || true
+done
+rm -rf "$prefix" /var/cache/waydroid-venus /var/cache/waydroid-hwdec
+rm -f "$sysusers" "$hwdec_sysusers"
+for account in waydroid-venus waydroid-hwdec; do
+   if getent passwd "$account" > /dev/null; then
+      userdel "$account"
+   fi
+done
 
 if [ -f "$legacy_unit" ]; then
    systemctl --user -M "$user@" disable --now waydroid-venus.service || true
