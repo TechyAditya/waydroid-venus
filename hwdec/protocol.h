@@ -4,17 +4,18 @@
  * request header followed by `size` payload bytes; the host answers every
  * request with exactly one reply.  All integers are little endian.
  *
- * Decoded frames are I420.  The host writes a frame into a target buffer
- * the client registered, which is how frames go straight into Android's
- * gralloc buffers, or else into a shared memfd that it attaches
- * (SCM_RIGHTS) to the reply that first uses it.
+ * The host writes a frame into a target buffer the client registered, which
+ * is how frames go straight into Android's gralloc buffers, or else into a
+ * shared memfd that it attaches (SCM_RIGHTS) to the reply that first uses
+ * it.  8-bit frames are I420; 10-bit frames are P010 in targets and 16-bit
+ * I420 in the shared memory.
  */
 #ifndef WAYDROID_HWDEC_PROTOCOL_H
 #define WAYDROID_HWDEC_PROTOCOL_H
 
 #include <stdint.h>
 
-#define HWDEC_VERSION 2
+#define HWDEC_VERSION 3
 #define HWDEC_SOCKET_NAME "hwdec.sock"
 #define HWDEC_MAX_PACKET_SIZE (64u << 20)
 #define HWDEC_MAX_DIMENSION 8192u
@@ -58,6 +59,17 @@ enum hwdec_reply_type {
    HWDEC_REPLY_EOS = 5,
 };
 
+enum hwdec_format {
+   /* 8-bit Y, Cb and Cr planes */
+   HWDEC_FORMAT_I420 = 1,
+   /* 16-bit little-endian Y, Cb and Cr planes holding 10-bit values in the
+    * low bits, Android's OMX_COLOR_FormatYUV420Planar16 */
+   HWDEC_FORMAT_I420_10 = 2,
+   /* 16-bit Y plane and interleaved CbCr plane holding 10-bit values in the
+    * high bits */
+   HWDEC_FORMAT_P010 = 3,
+};
+
 /* the packet is codec configuration (csd), not a frame */
 #define HWDEC_PACKET_CONFIG (1u << 0)
 
@@ -90,14 +102,30 @@ struct hwdec_packet {
    struct hwdec_output output;
 };
 
-/* A buffer of the attached memfd with Y, Cb and Cr planes at these offsets.
- * The memfd must be sealed against shrinking. */
+/* A buffer of the attached memfd with Y, Cb and Cr planes at these offsets
+ * (for P010, Cr follows Cb in the same plane).  The memfd must be sealed
+ * against shrinking.  The host writes only frames of the buffer's format:
+ * I420 or P010. */
 struct hwdec_target {
    uint32_t id; /* 1 to HWDEC_MAX_TARGETS */
+   uint32_t format;
    uint32_t width;
    uint32_t height;
    uint32_t offset[3];
    uint32_t stride[3];
+};
+
+/* SMPTE ST 2086 mastering display and CTA-861.3 content light levels, in
+ * the units of Android's HDRStaticInfo: chromaticities in 0.00002, maximum
+ * luminance in cd/m2, minimum in 0.0001 cd/m2.  All zero when the stream
+ * has none. */
+struct hwdec_hdr {
+   uint16_t primaries[3][2]; /* red, green, blue x and y */
+   uint16_t white[2];
+   uint16_t max_luminance;
+   uint16_t min_luminance;
+   uint16_t max_cll;
+   uint16_t max_fall;
 };
 
 struct hwdec_reply {
@@ -108,7 +136,10 @@ struct hwdec_reply {
    /* visible size of the frame */
    uint32_t width;
    uint32_t height;
-   /* I420 planes in the shared memory */
+   /* enum hwdec_format */
+   uint32_t format;
+   uint32_t reserved;
+   /* planes in the shared memory, in bytes */
    uint32_t offset[3];
    uint32_t stride[3];
    /* nonzero when a new shared memory fd is attached to this reply */
@@ -119,6 +150,19 @@ struct hwdec_reply {
    uint8_t matrix;
    uint8_t full_range;
    uint32_t flags;
+   struct hwdec_hdr hdr;
 };
+
+/* The client is 32-bit and the host 64-bit, which align uint64_t
+ * differently, so the layouts are fixed. */
+#ifdef __cplusplus
+#define HWDEC_ASSERT(e) static_assert(e, #e)
+#else
+#define HWDEC_ASSERT(e) _Static_assert(e, #e)
+#endif
+HWDEC_ASSERT(sizeof(struct hwdec_packet) == 24);
+HWDEC_ASSERT(sizeof(struct hwdec_target) == 40);
+HWDEC_ASSERT(sizeof(struct hwdec_hdr) == 24);
+HWDEC_ASSERT(sizeof(struct hwdec_reply) == 96);
 
 #endif

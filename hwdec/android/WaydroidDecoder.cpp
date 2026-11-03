@@ -42,6 +42,8 @@ constexpr OMX_U32 kMinCompressionRatio = 2;
 // a stuck host must not hang media.codec forever
 constexpr int kTimeoutSeconds = 5;
 constexpr OMX_COLOR_FORMATTYPE kNativeFormat = static_cast<OMX_COLOR_FORMATTYPE>(HAL_PIXEL_FORMAT_YV12);
+constexpr OMX_COLOR_FORMATTYPE kNativeFormat10 =
+        static_cast<OMX_COLOR_FORMATTYPE>(HAL_PIXEL_FORMAT_YCBCR_P010);
 constexpr uint32_t kNativeUsage = GRALLOC_USAGE_SW_WRITE_OFTEN;
 
 const CodecProfileLevel kAvcProfileLevels[] = {
@@ -52,9 +54,14 @@ const CodecProfileLevel kAvcProfileLevels[] = {
     {OMX_VIDEO_AVCProfileHigh, OMX_VIDEO_AVCLevel52},
 };
 
+// 10-bit streams come out as P010 or 16-bit planar, and HDR10 metadata is
+// passed on, so the 10-bit and HDR10 profiles are supported.  HDR10+
+// dynamic metadata is not.
 const CodecProfileLevel kHevcProfileLevels[] = {
     {OMX_VIDEO_HEVCProfileMain, OMX_VIDEO_HEVCMainTierLevel52},
     {OMX_VIDEO_HEVCProfileMainStill, OMX_VIDEO_HEVCMainTierLevel52},
+    {OMX_VIDEO_HEVCProfileMain10, OMX_VIDEO_HEVCMainTierLevel52},
+    {OMX_VIDEO_HEVCProfileMain10HDR10, OMX_VIDEO_HEVCMainTierLevel52},
 };
 
 const CodecProfileLevel kVp8ProfileLevels[] = {
@@ -63,10 +70,14 @@ const CodecProfileLevel kVp8ProfileLevels[] = {
 
 const CodecProfileLevel kVp9ProfileLevels[] = {
     {OMX_VIDEO_VP9Profile0, OMX_VIDEO_VP9Level52},
+    {OMX_VIDEO_VP9Profile2, OMX_VIDEO_VP9Level52},
+    {OMX_VIDEO_VP9Profile2HDR, OMX_VIDEO_VP9Level52},
 };
 
 const CodecProfileLevel kAv1ProfileLevels[] = {
     {OMX_VIDEO_AV1ProfileMain8, OMX_VIDEO_AV1Level52},
+    {OMX_VIDEO_AV1ProfileMain10, OMX_VIDEO_AV1Level52},
+    {OMX_VIDEO_AV1ProfileMain10HDR10, OMX_VIDEO_AV1Level52},
 };
 
 struct CodecInfo {
@@ -129,6 +140,7 @@ class WaydroidDecoder : public SoftVideoDecoderOMXComponent {
     void onReset() override;
 
     int getColorAspectPreference() override { return kPreferBitstream; }
+    bool supportDescribeHdrStaticInfo() override { return true; }
 
   private:
     enum {
@@ -174,6 +186,10 @@ class WaydroidDecoder : public SoftVideoDecoderOMXComponent {
     hwdec_output outputFor(OMX_BUFFERHEADERTYPE *outHeader);
     uint32_t registerTarget(buffer_handle_t handle);
     bool copyToGraphicBuffer(const hwdec_reply &frame, buffer_handle_t handle);
+    // The output color format FRAME needs.
+    OMX_COLOR_FORMATTYPE formatFor(const hwdec_reply &frame) const;
+    // Takes on FRAME's HDR10 metadata, telling ACodec when it changes.
+    void updateHdrStaticInfo(const hwdec_reply &frame);
     // Returns false if the output port must reconfigure before the frame can
     // be written.
     bool outputFrame(const hwdec_reply &frame, BufferInfo *outInfo);
@@ -346,14 +362,18 @@ uint32_t WaydroidDecoder::registerTarget(buffer_handle_t handle) {
         uint8_t *planes[3] = {static_cast<uint8_t *>(ycbcr.y), static_cast<uint8_t *>(ycbcr.cb),
                               static_cast<uint8_t *>(ycbcr.cr)};
         size_t strides[3] = {ycbcr.ystride, ycbcr.cstride, ycbcr.cstride};
-        bool planar = ycbcr.chroma_step == 1;
+        // YV12 has three planes; P010 interleaves 16-bit Cb and Cr
+        if (ycbcr.chroma_step == 1)
+            layout.format = HWDEC_FORMAT_I420;
+        else if (ycbcr.chroma_step == 4 && planes[2] == planes[1] + 2)
+            layout.format = HWDEC_FORMAT_P010;
         for (int i = 0; i < 3; i++) {
-            if (planes[i] < static_cast<uint8_t *>(base)) planar = false;
+            if (planes[i] < static_cast<uint8_t *>(base)) layout.format = 0;
             layout.offset[i] = planes[i] - static_cast<uint8_t *>(base);
             layout.stride[i] = strides[i];
         }
         hwdec_reply reply;
-        if (planar && handle->numFds >= 1) {
+        if (layout.format && handle->numFds >= 1) {
             if (!request(HWDEC_REQUEST_REGISTER, &layout, sizeof(layout), nullptr, 0,
                          handle->data[0], &reply))
                 return 0;
@@ -388,21 +408,65 @@ bool WaydroidDecoder::copyToGraphicBuffer(const hwdec_reply &frame, buffer_handl
     uint8_t *dst[3] = {static_cast<uint8_t *>(ycbcr.y), static_cast<uint8_t *>(ycbcr.cb),
                        static_cast<uint8_t *>(ycbcr.cr)};
     size_t dstStride[3] = {ycbcr.ystride, ycbcr.cstride, ycbcr.cstride};
+    // The shared memory holds 8-bit or 16-bit (10 bits in the low bits)
+    // planes; the buffer is 8-bit planar YV12, or P010 with 16-bit samples
+    // holding 10 bits in the high bits and Cb Cr interleaved.
+    bool srcDeep = frame.format == HWDEC_FORMAT_I420_10;
+    bool dstDeep = mOutputFormat == kNativeFormat10;
+    size_t step = dstDeep ? 2 : 1;
+    if (ycbcr.chroma_step != (dstDeep ? 4u : 1u)) {
+        mGralloc->unlock(mGralloc, handle);
+        return false;
+    }
     for (int i = 0; i < 3; i++) {
         uint32_t w = i ? (frame.width + 1) / 2 : frame.width;
         uint32_t h = i ? (frame.height + 1) / 2 : frame.height;
+        size_t pixelStep = i ? ycbcr.chroma_step : step;
         const uint8_t *src = mShm + frame.offset[i];
         for (uint32_t y = 0; y < h; y++) {
-            if (ycbcr.chroma_step == 1 || i == 0) {
-                memcpy(dst[i] + y * dstStride[i], src + y * frame.stride[i], w);
-            } else {
-                for (uint32_t x = 0; x < w; x++)
-                    dst[i][y * dstStride[i] + x * ycbcr.chroma_step] = src[y * frame.stride[i] + x];
+            const uint8_t *s = src + y * frame.stride[i];
+            uint8_t *d = dst[i] + y * dstStride[i];
+            if (!srcDeep && !dstDeep && pixelStep == 1) {
+                memcpy(d, s, w);
+                continue;
+            }
+            for (uint32_t x = 0; x < w; x++) {
+                uint32_t v = srcDeep ? reinterpret_cast<const uint16_t *>(s)[x] << 6 : s[x] << 8;
+                if (dstDeep)
+                    *reinterpret_cast<uint16_t *>(d + x * pixelStep) = v;
+                else
+                    d[x * pixelStep] = v >> 8;
             }
         }
     }
     mGralloc->unlock(mGralloc, handle);
     return true;
+}
+
+OMX_COLOR_FORMATTYPE WaydroidDecoder::formatFor(const hwdec_reply &frame) const {
+    bool deep = frame.format == HWDEC_FORMAT_I420_10 || frame.format == HWDEC_FORMAT_P010;
+    if (mNativeBuffers) return deep ? kNativeFormat10 : kNativeFormat;
+    return deep ? OMX_COLOR_FormatYUV420Planar16 : OMX_COLOR_FormatYUV420Planar;
+}
+
+void WaydroidDecoder::updateHdrStaticInfo(const hwdec_reply &frame) {
+    const hwdec_hdr &h = frame.hdr;
+    if (!h.max_luminance && !h.max_cll && !h.primaries[0][0]) return;
+    HDRStaticInfo info = {};
+    info.mID = HDRStaticInfo::kType1;
+    info.sType1.mR = {h.primaries[0][0], h.primaries[0][1]};
+    info.sType1.mG = {h.primaries[1][0], h.primaries[1][1]};
+    info.sType1.mB = {h.primaries[2][0], h.primaries[2][1]};
+    info.sType1.mW = {h.white[0], h.white[1]};
+    info.sType1.mMaxDisplayLuminance = h.max_luminance;
+    info.sType1.mMinDisplayLuminance = h.min_luminance;
+    info.sType1.mMaxContentLightLevel = h.max_cll;
+    info.sType1.mMaxFrameAverageLightLevel = h.max_fall;
+    if (!memcmp(&info, &mHdrStaticInfo, sizeof(info))) return;
+    mHdrStaticInfo = info;
+    // ACodec rereads the output format, HDR metadata included, on any port
+    // settings change
+    notify(OMX_EventPortSettingsChanged, kOutputPortIndex, kDescribeHdrStaticInfoIndex, nullptr);
 }
 
 bool WaydroidDecoder::outputFrame(const hwdec_reply &frame, BufferInfo *outInfo) {
@@ -414,12 +478,16 @@ bool WaydroidDecoder::outputFrame(const hwdec_reply &frame, BufferInfo *outInfo)
         handleColorAspectsChange();
     }
 
+    updateHdrStaticInfo(frame);
+
+    // a change of bit depth reconfigures the port like a change of size
     bool portWillReset = false;
-    handlePortSettingsChange(&portWillReset, frame.width, frame.height, mOutputFormat);
+    handlePortSettingsChange(&portWillReset, frame.width, frame.height, formatFor(frame));
     if (portWillReset) return false;
 
     OMX_BUFFERHEADERTYPE *outHeader = outInfo->mHeader;
-    size_t size = (size_t)outputBufferWidth() * outputBufferHeight() * 3 / 2;
+    size_t bpp = mOutputFormat == OMX_COLOR_FormatYUV420Planar16 ? 2 : 1;
+    size_t size = (size_t)outputBufferWidth() * outputBufferHeight() * 3 / 2 * bpp;
     if (mNativeBuffers) {
         auto handle = reinterpret_cast<buffer_handle_t>(outHeader->pBuffer);
         if (!(frame.flags & HWDEC_FRAME_IN_TARGET) && !copyToGraphicBuffer(frame, handle)) {
@@ -490,7 +558,7 @@ OMX_ERRORTYPE WaydroidDecoder::internalGetParameter(OMX_INDEXTYPE index, OMX_PTR
             OMX_ERRORTYPE err = SoftVideoDecoderOMXComponent::internalGetParameter(index, params);
             auto *param = static_cast<OMX_VIDEO_PARAM_PORTFORMATTYPE *>(params);
             if (err == OMX_ErrorNone && param->nPortIndex == kOutputPortIndex && mNativeBuffers)
-                param->eColorFormat = kNativeFormat;
+                param->eColorFormat = mOutputFormat;
             return err;
         }
     }
@@ -516,7 +584,7 @@ OMX_ERRORTYPE WaydroidDecoder::internalSetParameter(OMX_INDEXTYPE index, const O
             if (!isValidOMXParam(param)) return OMX_ErrorBadParameter;
             if (param->nPortIndex == kOutputPortIndex && mNativeBuffers) {
                 bool ok = param->eCompressionFormat == OMX_VIDEO_CodingUnused &&
-                          param->eColorFormat == kNativeFormat;
+                          param->eColorFormat == mOutputFormat;
                 return ok ? OMX_ErrorNone : OMX_ErrorUnsupportedSetting;
             }
             break;
@@ -529,8 +597,10 @@ bool frameFits(const hwdec_reply &f, size_t shmSize) {
     if (!f.width || !f.height || f.width > HWDEC_MAX_DIMENSION || f.height > HWDEC_MAX_DIMENSION)
         return false;
     if (f.flags & HWDEC_FRAME_IN_TARGET) return true;
+    if (f.format != HWDEC_FORMAT_I420 && f.format != HWDEC_FORMAT_I420_10) return false;
+    uint32_t bpp = f.format == HWDEC_FORMAT_I420_10 ? 2 : 1;
     uint32_t rows[3] = {f.height, (f.height + 1) / 2, (f.height + 1) / 2};
-    uint32_t widths[3] = {f.width, (f.width + 1) / 2, (f.width + 1) / 2};
+    uint32_t widths[3] = {f.width * bpp, (f.width + 1) / 2 * bpp, (f.width + 1) / 2 * bpp};
     for (int i = 0; i < 3; i++) {
         if (f.stride[i] < widths[i]) return false;
         uint64_t end = f.offset[i] + (uint64_t)f.stride[i] * rows[i];
