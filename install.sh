@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Run with sudo after build.sh.  Installs the Venus driver into Waydroid,
-# runs the render server as a sandboxed system service and restarts a
-# running Waydroid container to apply the new properties.  On failure it
-# restores everything it changed.
+# Run with sudo after build.sh.  Installs the Venus driver and the video
+# decoders into Waydroid, runs the render server and the video decoder as
+# sandboxed system services and restarts a running Waydroid container to
+# apply the new properties.  On failure it restores everything it changed.
 set -eEuo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -17,6 +17,8 @@ cfg=/var/lib/waydroid/waydroid.cfg
 backup=/var/lib/waydroid/waydroid-venus-properties.json
 unit=/etc/systemd/system/waydroid-venus.service
 sysusers=/etc/sysusers.d/waydroid-venus.conf
+hwdec_unit=/etc/systemd/system/waydroid-hwdec.service
+hwdec_sysusers=/etc/sysusers.d/waydroid-hwdec.conf
 socket_dir=$home/.local/share/waydroid/data/venus
 # earlier versions ran the server as a user service
 legacy_unit=$home/.config/systemd/user/waydroid-venus.service
@@ -28,12 +30,17 @@ overlay_files=()
 for module in "${modules[@]}"; do
    overlay_files+=("$overlay/$(dirname "$module")/hw/$(basename "$module")")
 done
+# build/out/PATH goes to the overlay as vendor/PATH.  The seccomp policy and
+# codec list are the image's with additions, which build.sh made.
+hwdec_files=(lib/libstagefrighthw.so etc/media_codecs_waydroid.xml
+   etc/media_codecs_waydroid_hwdec.xml etc/seccomp_policy/mediacodec.policy)
 
 missing=0
-for file in "${modules[@]/#/$out/}" \
-   "$host/bin/virgl_test_server" "$host/libexec/virgl_render_server" \
+for file in "${modules[@]/#/$out/}" "${hwdec_files[@]/#/$out/}" \
+   "$host/bin/virgl_test_server" "$host/libexec/virgl_render_server" "$host/bin/waydroid-hwdec" \
    "$here/android/waydroid-venus-recover.sh" "$here/android/waydroid-venus.rc" \
-   "$here/waydroid-venus.service" "$here/waydroid-venus.sysusers"; do
+   "$here/waydroid-venus.service" "$here/waydroid-venus.sysusers" \
+   "$here/waydroid-hwdec.service" "$here/waydroid-hwdec.sysusers"; do
    if [ ! -f "$file" ]; then
       echo "missing $file" >&2
       missing=1
@@ -46,6 +53,8 @@ done
 tx=$(mktemp -d)
 was_active=$(systemctl is-active waydroid-venus.service 2> /dev/null || true)
 was_enabled=$(systemctl is-enabled waydroid-venus.service 2> /dev/null || true)
+hwdec_was_active=$(systemctl is-active waydroid-hwdec.service 2> /dev/null || true)
+hwdec_was_enabled=$(systemctl is-enabled waydroid-hwdec.service 2> /dev/null || true)
 legacy_stopped=0
 save() {
    local path
@@ -62,8 +71,9 @@ save() {
 rollback() {
    trap - ERR
    echo "installation failed, restoring the previous state" >&2
-   systemctl stop waydroid-venus.service 2> /dev/null || true
+   systemctl stop waydroid-venus.service waydroid-hwdec.service 2> /dev/null || true
    [ "$was_enabled" = enabled ] || systemctl disable waydroid-venus.service 2> /dev/null || true
+   [ "$hwdec_was_enabled" = enabled ] || systemctl disable waydroid-hwdec.service 2> /dev/null || true
    if [ -f "$tx/absent" ]; then
       while read -r path; do rm -rf "$path"; done < "$tx/absent"
    fi
@@ -75,6 +85,7 @@ rollback() {
    fi
    systemctl daemon-reload
    [ "$was_active" = active ] && systemctl start waydroid-venus.service
+   [ "$hwdec_was_active" = active ] && systemctl start waydroid-hwdec.service
    if [ "$legacy_stopped" = 1 ]; then
       systemctl --user -M "$user@" start waydroid-venus.service || true
    fi
@@ -83,11 +94,13 @@ rollback() {
 }
 trap rollback ERR
 
-save "$prefix" "$cfg" "$backup" "$unit" "$sysusers" "${overlay_files[@]}" \
+save "$prefix" "$cfg" "$backup" "$unit" "$sysusers" "$hwdec_unit" "$hwdec_sysusers" \
+   "${overlay_files[@]}" "${hwdec_files[@]/#/$overlay/}" \
    "$overlay/bin/waydroid-venus-recover.sh" "$overlay/etc/init/waydroid-venus.rc"
 
 install -D -m 0644 "$here/waydroid-venus.sysusers" "$sysusers"
-systemd-sysusers "$sysusers"
+install -D -m 0644 "$here/waydroid-hwdec.sysusers" "$hwdec_sysusers"
+systemd-sysusers "$sysusers" "$hwdec_sysusers"
 
 rm -rf "$prefix.new"
 cp -a "$host" "$prefix.new"
@@ -97,6 +110,9 @@ mv "$prefix.new" "$prefix"
 
 for i in "${!modules[@]}"; do
    install -D -m 0644 "$out/${modules[$i]}" "${overlay_files[$i]}"
+done
+for file in "${hwdec_files[@]}"; do
+   install -D -m 0644 "$out/$file" "$overlay/$file"
 done
 install -D -m 0755 "$here/android/waydroid-venus-recover.sh" \
    "$overlay/bin/waydroid-venus-recover.sh"
@@ -113,17 +129,24 @@ props = {
     "ro.hardware.vulkan": "virtio",
     "mesa.vn.debug": "vtest",
     "mesa.vtest.socket.name": "/data/venus/vtest.sock",
+    # media_codecs_waydroid.xml, which adds the OMX.waydroid decoders
+    "ro.media.xml_variant.codecs": "_waydroid",
 }
 cfg = configparser.ConfigParser()
 cfg.read(cfg_path)
 if not cfg.has_section("properties"):
     cfg.add_section("properties")
-if not os.path.exists(backup_path):
-    previous = {}
-    for key, value in props.items():
+previous = {}
+if os.path.exists(backup_path):
+    with open(backup_path) as f:
+        previous = json.load(f)
+# keys added since the last install are backed up now
+missing = [key for key in props if key not in previous]
+if missing:
+    for key in missing:
         current = cfg["properties"].get(key)
         # an install from before backups existed set these values itself
-        previous[key] = None if legacy and current == value else current
+        previous[key] = None if legacy and current == props[key] else current
     with open(backup_path, "w") as f:
         json.dump(previous, f)
 cfg["properties"].update(props)
@@ -137,16 +160,21 @@ if [ "$legacy" = 1 ]; then
    legacy_stopped=1
 fi
 
-sed -e "s|@PREFIX@|$prefix|g" -e "s|@SOCKET_DIR@|$socket_dir|g" -e "s|@USER@|$user|g" \
-   "$here/waydroid-venus.service" > "$unit"
+substitute() {
+   sed -e "s|@PREFIX@|$prefix|g" -e "s|@SOCKET_DIR@|$socket_dir|g" -e "s|@USER@|$user|g" "$1"
+}
+substitute "$here/waydroid-venus.service" > "$unit"
+substitute "$here/waydroid-hwdec.service" > "$hwdec_unit"
 systemctl daemon-reload
-systemctl enable waydroid-venus.service
-systemctl restart waydroid-venus.service
-for _ in $(seq 50); do
-   [ -S "$socket_dir/vtest.sock" ] && [ "$(stat -c %a "$socket_dir/vtest.sock")" = 666 ] && break
-   sleep 0.2
+systemctl enable waydroid-venus.service waydroid-hwdec.service
+systemctl restart waydroid-venus.service waydroid-hwdec.service
+for socket in vtest.sock hwdec.sock; do
+   for _ in $(seq 50); do
+      [ -S "$socket_dir/$socket" ] && [ "$(stat -c %a "$socket_dir/$socket")" = 666 ] && break
+      sleep 0.2
+   done
+   [ "$(stat -c %a "$socket_dir/$socket" 2> /dev/null)" = 666 ]
 done
-[ "$(stat -c %a "$socket_dir/vtest.sock" 2> /dev/null)" = 666 ]
 
 # regenerates waydroid_base.prop and restarts a running container
 waydroid upgrade --offline

@@ -14,7 +14,9 @@ CacheDirectory=waydroid-venus
 # Waydroid shows its data directory to Android as /data.  Other services,
 # such as a hardware decoder, keep sockets in the same directory, so it stays
 # owned by the Waydroid user and the server gets access through an ACL.
-ExecStartPre=+/usr/bin/install -d -o @USER@ -g @USER@ -m 0755 @SOCKET_DIR@
+# Changing the mode of the existing directory would reset the ACL mask and
+# lock out the other services, so it is only created when missing.
+ExecStartPre=+/bin/sh -c '[ -d "$1" ] || install -d -o "$2" -g "$2" -m 0755 "$1"' sh @SOCKET_DIR@ @USER@
 ExecStartPre=+/usr/bin/setfacl -m u:waydroid-venus:rwx @SOCKET_DIR@
 ExecStartPre=+/usr/bin/rm -f @SOCKET_DIR@/vtest.sock
 ExecStart=@PREFIX@/bin/virgl_test_server --venus --no-virgl --socket-path @SOCKET_DIR@/vtest.sock
