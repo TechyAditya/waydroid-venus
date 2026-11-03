@@ -24,6 +24,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/mastering_display_metadata.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 
@@ -214,10 +215,19 @@ register_target(struct session *s, const struct hwdec_target *layout)
        fstat(fd, &st) < 0 || st.st_size <= 0 || st.st_size > (1 << 30))
       goto out;
    size_t size = st.st_size;
-   if (!plane_fits(layout->offset[0], layout->stride[0], w, h, size) ||
-       !plane_fits(layout->offset[1], layout->stride[1], cw, ch, size) ||
-       !plane_fits(layout->offset[2], layout->stride[2], cw, ch, size))
+   if (layout->format == HWDEC_FORMAT_I420) {
+      if (!plane_fits(layout->offset[0], layout->stride[0], w, h, size) ||
+          !plane_fits(layout->offset[1], layout->stride[1], cw, ch, size) ||
+          !plane_fits(layout->offset[2], layout->stride[2], cw, ch, size))
+         goto out;
+   } else if (layout->format == HWDEC_FORMAT_P010) {
+      /* 16-bit samples; CbCr pairs in the second plane */
+      if (!plane_fits(layout->offset[0], layout->stride[0], 2 * (uint64_t)w, h, size) ||
+          !plane_fits(layout->offset[1], layout->stride[1], 4 * (uint64_t)cw, ch, size))
+         goto out;
+   } else {
       goto out;
+   }
 
    uint8_t *map = mmap(NULL, size, PROT_WRITE, MAP_SHARED, fd, 0);
    if (map == MAP_FAILED)
@@ -398,6 +408,43 @@ receive_frames(struct session *s)
    return 0;
 }
 
+static uint16_t
+scaled(AVRational r, int scale)
+{
+   if (!r.den)
+      return 0;
+   int64_t v = av_rescale(r.num, scale, r.den);
+   return v < 0 ? 0 : v > UINT16_MAX ? UINT16_MAX : v;
+}
+
+static void
+fill_hdr(struct hwdec_hdr *hdr, const AVFrame *frame)
+{
+   const AVFrameSideData *sd =
+      av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+   if (sd) {
+      const AVMasteringDisplayMetadata *m = (const void *)sd->data;
+      if (m->has_primaries) {
+         for (int i = 0; i < 3; i++) {
+            hdr->primaries[i][0] = scaled(m->display_primaries[i][0], 50000);
+            hdr->primaries[i][1] = scaled(m->display_primaries[i][1], 50000);
+         }
+         hdr->white[0] = scaled(m->white_point[0], 50000);
+         hdr->white[1] = scaled(m->white_point[1], 50000);
+      }
+      if (m->has_luminance) {
+         hdr->max_luminance = scaled(m->max_luminance, 1);
+         hdr->min_luminance = scaled(m->min_luminance, 10000);
+      }
+   }
+   sd = av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+   if (sd) {
+      const AVContentLightMetadata *c = (const void *)sd->data;
+      hdr->max_cll = c->MaxCLL > UINT16_MAX ? UINT16_MAX : c->MaxCLL;
+      hdr->max_fall = c->MaxFALL > UINT16_MAX ? UINT16_MAX : c->MaxFALL;
+   }
+}
+
 /* Converts the next queued frame into OUT's target, or else the shared
  * memory, and replies with it. */
 static bool
@@ -422,38 +469,42 @@ reply_frame(struct session *s, const struct hwdec_output *out)
       return reply_simple(s, HWDEC_REPLY_ERROR);
    }
    unsigned cw = (w + 1) / 2, ch = (h + 1) / 2;
+   bool deep = av_pix_fmt_desc_get(src->format)->comp[0].depth > 8;
    struct hwdec_reply reply = {
       .type = HWDEC_REPLY_FRAME,
       .pending = s->queued,
       .timestamp = frame->pts != AV_NOPTS_VALUE ? frame->pts : frame->best_effort_timestamp,
       .width = w,
       .height = h,
-      .stride = { FFALIGN(w, 64), FFALIGN(cw, 64), FFALIGN(cw, 64) },
       .primaries = frame->color_primaries,
       .transfer = frame->color_trc,
       .matrix = frame->colorspace,
       .full_range = frame->color_range == AVCOL_RANGE_JPEG,
    };
-   s->sws = sws_getCachedContext(s->sws, w, h, src->format, w, h, AV_PIX_FMT_YUV420P,
-                                 SWS_BILINEAR, NULL, NULL, NULL);
-   if (!s->sws) {
-      av_frame_free(&frame);
-      return reply_simple(s, HWDEC_REPLY_ERROR);
-   }
+   fill_hdr(&reply.hdr, frame);
 
-   uint8_t *dst[4];
-   int dst_stride[4];
+   uint8_t *dst[4] = { 0 };
+   int dst_stride[4] = { 0 };
+   enum AVPixelFormat dst_format;
    const struct target *t = NULL;
    if (out->target >= 1 && out->target <= HWDEC_MAX_TARGETS)
       t = &s->targets[out->target - 1];
    if (t && t->map && w == out->width && h == out->height && w <= t->layout.width &&
-       h <= t->layout.height) {
-      for (int i = 0; i < 3; i++) {
+       h <= t->layout.height &&
+       t->layout.format == (deep ? HWDEC_FORMAT_P010 : HWDEC_FORMAT_I420)) {
+      int planes = deep ? 2 : 3;
+      for (int i = 0; i < planes; i++) {
          dst[i] = t->map + t->layout.offset[i];
          dst_stride[i] = t->layout.stride[i];
       }
+      reply.format = t->layout.format;
       reply.flags |= HWDEC_FRAME_IN_TARGET;
+      dst_format = deep ? AV_PIX_FMT_P010LE : AV_PIX_FMT_YUV420P;
    } else {
+      unsigned bpp = deep ? 2 : 1;
+      reply.format = deep ? HWDEC_FORMAT_I420_10 : HWDEC_FORMAT_I420;
+      reply.stride[0] = FFALIGN(w * bpp, 64);
+      reply.stride[1] = reply.stride[2] = FFALIGN(cw * bpp, 64);
       reply.offset[1] = reply.stride[0] * h;
       reply.offset[2] = reply.offset[1] + reply.stride[1] * ch;
       size_t size = reply.offset[2] + (size_t)reply.stride[2] * ch;
@@ -465,6 +516,13 @@ reply_frame(struct session *s, const struct hwdec_output *out)
          dst[i] = s->shm + reply.offset[i];
          dst_stride[i] = reply.stride[i];
       }
+      dst_format = deep ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
+   }
+   s->sws = sws_getCachedContext(s->sws, w, h, src->format, w, h, dst_format, SWS_BILINEAR,
+                                 NULL, NULL, NULL);
+   if (!s->sws) {
+      av_frame_free(&frame);
+      return reply_simple(s, HWDEC_REPLY_ERROR);
    }
    sws_scale(s->sws, (const uint8_t *const *)src->data, src->linesize, 0, h, dst, dst_stride);
    av_frame_free(&frame);
