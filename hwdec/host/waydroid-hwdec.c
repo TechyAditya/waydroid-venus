@@ -133,6 +133,13 @@ struct session {
    size_t shm_size;
    bool shm_sent;
    unsigned bad_packets;
+   /* frames after one the GPU rejected reference a picture that was never
+    * decoded, so they are dropped until the next keyframe */
+   bool await_keyframe;
+   /* AV1 only: reads each keyframe's size, with a context of its own */
+   AVCodecParserContext *parser;
+   AVCodecContext *parser_ctx;
+   int width, height;
 };
 
 /* Reads SIZE bytes, keeping an attached fd in s->received_fd. */
@@ -342,6 +349,8 @@ get_format(AVCodecContext *ctx, const enum AVPixelFormat *formats)
    return AV_PIX_FMT_NONE;
 }
 
+static bool create_context(struct session *s, const AVCodec *codec);
+
 static bool
 open_decoder(struct session *s, const struct hwdec_open *open)
 {
@@ -359,12 +368,40 @@ open_decoder(struct session *s, const struct hwdec_open *open)
    const AVCodec *codec = avcodec_find_decoder_by_name(names[open->codec]);
    if (!codec)
       return false;
-   s->ctx = avcodec_alloc_context3(codec);
    s->pkt = av_packet_alloc();
    s->download = av_frame_alloc();
-   if (!s->ctx || !s->pkt || !s->download)
+   if (!s->pkt || !s->download)
       return false;
+   if (codec->id == AV_CODEC_ID_AV1) {
+      s->parser = av_parser_init(AV_CODEC_ID_AV1);
+      s->parser_ctx = avcodec_alloc_context3(NULL);
+      if (!s->parser || !s->parser_ctx)
+         return false;
+      s->parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
+   }
+   return create_context(s, codec);
+}
 
+/* FFmpeg's AV1 decoder keeps the GPU decoder it created for the first
+ * sequence when a stream changes size, which adaptive streaming does at
+ * keyframes.  NVDEC then rejects larger frames and writes smaller ones with
+ * the old layout.  A new decoder starts over at the packet's sequence header.
+ * Queued frames hold references to their own surfaces and stay valid. */
+static bool
+reopen_decoder(struct session *s)
+{
+   const AVCodec *codec = s->ctx->codec;
+   avcodec_free_context(&s->ctx);
+   s->eof = false;
+   return create_context(s, codec);
+}
+
+static bool
+create_context(struct session *s, const AVCodec *codec)
+{
+   s->ctx = avcodec_alloc_context3(codec);
+   if (!s->ctx)
+      return false;
    s->ctx->hw_device_ctx = get_device();
    s->ctx->get_format = get_format;
    s->ctx->extra_hw_frames = EXTRA_HW_FRAMES;
@@ -387,6 +424,7 @@ clear_queue(struct session *s)
 static int
 receive_frames(struct session *s)
 {
+   unsigned rejected = 0;
    while (s->queued < MAX_QUEUED_FRAMES) {
       AVFrame *frame = av_frame_alloc();
       if (!frame)
@@ -401,11 +439,37 @@ receive_frames(struct session *s)
          /* a corrupt frame; the decoder recovers at the next one */
          if (err == AVERROR_INVALIDDATA)
             continue;
+         if (err == AVERROR_EXTERNAL && rejected++ < MAX_QUEUED_FRAMES) {
+            s->await_keyframe = true;
+            continue;
+         }
          return err;
       }
+      if (s->await_keyframe && !(frame->flags & AV_FRAME_FLAG_KEY)) {
+         av_frame_free(&frame);
+         continue;
+      }
+      s->await_keyframe = false;
       s->queue[s->queued++] = frame;
    }
    return 0;
+}
+
+/* Sends s->pkt, making room in the queue while the decoder is full. */
+static int
+send_packet(struct session *s)
+{
+   for (;;) {
+      int err = avcodec_send_packet(s->ctx, s->pkt);
+      if (err != AVERROR(EAGAIN))
+         return err;
+      unsigned before = s->queued;
+      int rerr = receive_frames(s);
+      if (rerr < 0)
+         return rerr;
+      if (s->queued == before)
+         return err;
+   }
 }
 
 static uint16_t
@@ -566,16 +630,30 @@ handle_decode(struct session *s, uint32_t size)
       s->config_size = 0;
       s->pkt->pts = hdr.timestamp;
 
-      int err;
-      for (;;) {
-         err = avcodec_send_packet(s->ctx, s->pkt);
-         if (err != AVERROR(EAGAIN))
-            break;
-         unsigned before = s->queued;
-         if (receive_frames(s) < 0)
+      if (s->parser && s->ctx->hw_device_ctx) {
+         uint8_t *out;
+         int out_size;
+         av_parser_parse2(s->parser, s->parser_ctx, &out, &out_size, s->pkt->data, s->pkt->size,
+                          AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+         int w = s->parser->width, h = s->parser->height;
+         if (s->parser->key_frame == 1 && w > 0 && h > 0 && (w != s->width || h != s->height)) {
+            if (s->width && !reopen_decoder(s))
+               return reply_simple(s, HWDEC_REPLY_ERROR);
+            s->width = w;
+            s->height = h;
+         }
+      }
+
+      int err = send_packet(s);
+      if (err == AVERROR_EXTERNAL && s->ctx->hw_device_ctx) {
+         log_msg("%s: the GPU rejected a frame; restarting the decoder", s->ctx->codec->name);
+         if (!reopen_decoder(s))
             return reply_simple(s, HWDEC_REPLY_ERROR);
-         if (s->queued == before)
-            break;
+         err = send_packet(s);
+         if (err == AVERROR_EXTERNAL) {
+            s->await_keyframe = true;
+            err = AVERROR_INVALIDDATA;
+         }
       }
       if (err == AVERROR_INVALIDDATA || err == AVERROR(EAGAIN)) {
          if (s->bad_packets++ < 10)
@@ -622,6 +700,7 @@ handle_drain(struct session *s, const struct hwdec_output *out)
 
    avcodec_flush_buffers(s->ctx);
    s->draining = false;
+   s->await_keyframe = false;
    s->eof = false;
    return reply_simple(s, HWDEC_REPLY_EOS);
 }
@@ -669,6 +748,7 @@ handle_request(struct session *s, const struct hwdec_request *req)
       clear_queue(s);
       avcodec_flush_buffers(s->ctx);
       s->draining = false;
+      s->await_keyframe = false;
       s->eof = false;
       return reply_simple(s, HWDEC_REPLY_OK);
    default:
@@ -710,6 +790,8 @@ session_main(void *arg)
    unregister_targets(s);
    clear_queue(s);
    avcodec_free_context(&s->ctx);
+   av_parser_close(s->parser);
+   avcodec_free_context(&s->parser_ctx);
    av_packet_free(&s->pkt);
    av_frame_free(&s->download);
    sws_freeContext(s->sws);
