@@ -1,8 +1,8 @@
 diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
-index ffe621b..777e6bc 100644
+index ffe621b..ce52495 100644
 --- a/src/venus/vkr_device_memory.c
 +++ b/src/venus/vkr_device_memory.c
-@@ -367,6 +367,11 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+@@ -367,6 +367,17 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
  
     struct vkr_device_memory *mem = vkr_device_memory_create_and_add(ctx, args);
     if (!mem) {
@@ -10,10 +10,64 @@ index ffe621b..777e6bc 100644
 +         vkr_log("failed to import res %u as %" PRIu64 " bytes of memory type %u: %d",
 +                 res_info->resourceId, alloc_info->allocationSize, mem_type_index,
 +                 args->ret);
++      } else {
++         /* The client allocates asynchronously and learns of the failure
++          * only when it next uses the memory. */
++         vkr_log("failed to allocate %" PRIu64 " bytes of memory type %u (flags 0x%x%s): %d",
++                 alloc_info->allocationSize, mem_type_index, property_flags,
++                 udmabuf_fd >= 0 ? ", udmabuf" : "", args->ret);
 +      }
        if (local_import_info.fd >= 0)
           close(local_import_info.fd);
        if (gbm_bo)
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index e2c3baa..9cc1aff 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -227,6 +227,33 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
+           VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT);
+    }
+ 
++   /* Host visible memory is allocated exportable so that the client can map
++    * it, but NVIDIA fails to allocate exportable memory from its device
++    * local, host visible (BAR) memory types.  Hide host access to those, so
++    * that clients map system memory types instead, which export.
++    */
++   if (physical_dev->properties.vendorID == 0x10de &&
++       (physical_dev->is_dma_buf_fd_export_supported ||
++        physical_dev->is_opaque_fd_export_supported)) {
++      VkPhysicalDeviceMemoryProperties *mem_props = &physical_dev->memory_properties;
++      const VkMemoryPropertyFlags host_flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
++                                               VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
++      bool has_system_host_visible = false;
++      for (uint32_t i = 0; i < mem_props->memoryTypeCount; i++) {
++         const VkMemoryPropertyFlags flags = mem_props->memoryTypes[i].propertyFlags;
++         if ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
++             !(flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
++            has_system_host_visible = true;
++      }
++      for (uint32_t i = 0; has_system_host_visible && i < mem_props->memoryTypeCount; i++) {
++         VkMemoryPropertyFlags *flags = &mem_props->memoryTypes[i].propertyFlags;
++         if ((*flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
++             (*flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
++            *flags &= ~host_flags;
++      }
++   }
++
+    /* fallback to gbm allocation with dma-buf import */
+    if (!physical_dev->is_dma_buf_fd_export_supported &&
+        !physical_dev->is_opaque_fd_export_supported &&
+@@ -686,6 +713,9 @@ vkr_dispatch_vkGetPhysicalDeviceMemoryProperties2(
+       vn_replace_vkGetPhysicalDeviceMemoryProperties2_args_handle(args);
+       vk->GetPhysicalDeviceMemoryProperties2(args->physicalDevice,
+                                              args->pMemoryProperties);
++      /* the memory types as vkr_physical_device_init_memory_properties
++       * adjusted them */
++      args->pMemoryProperties->memoryProperties = physical_dev->memory_properties;
+    }
+ }
+ 
 diff --git a/vtest/vtest.h b/vtest/vtest.h
 index b2708a2..a9d924f 100644
 --- a/vtest/vtest.h
