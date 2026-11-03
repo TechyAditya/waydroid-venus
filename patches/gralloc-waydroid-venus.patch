@@ -1,5 +1,5 @@
 diff --git a/modules/gralloc/gralloc.cpp b/modules/gralloc/gralloc.cpp
-index 87bda97..d421a3c 100644
+index 87bda97..b5c3657 100644
 --- a/modules/gralloc/gralloc.cpp
 +++ b/modules/gralloc/gralloc.cpp
 @@ -26,6 +26,8 @@
@@ -41,7 +41,7 @@ index 87bda97..d421a3c 100644
          }
      }
      
-@@ -195,56 +206,115 @@ static int gralloc_alloc_buffer(alloc_device_t* dev,
+@@ -195,56 +206,119 @@ static int gralloc_alloc_buffer(alloc_device_t* dev,
  
  /*****************************************************************************/
  
@@ -93,13 +93,17 @@ index 87bda97..d421a3c 100644
  
 -    const size_t tileWidth = 2;
 -    const size_t tileHeight = 2;
-+    const uint64_t tileHeight = 2;
++    uint64_t tileHeight = 2;
 +    uint64_t stride, size;
 +    if (format == HAL_PIXEL_FORMAT_YV12 ||
 +            format == HAL_PIXEL_FORMAT_YCbCr_420_888) {
 +        // YV12 as Android defines it, which also serves as the flexible
-+        // YCbCr 4:2:0 layout through lock_ycbcr.
-+        stride = align(width, 64);
++        // YCbCr 4:2:0 layout through lock_ycbcr.  NVIDIA misreads planes
++        // whose rows are not 128-byte aligned or that do not start on 256
++        // bytes, so the luma stride is aligned to 256 bytes and the plane
++        // heights to 16 rows.  lock_ycbcr reports the padded layout.
++        tileHeight = 16;
++        stride = align(width, 256);
 +        const uint64_t cstride = align(stride / 2, 16);
 +        size = align(height, tileHeight) * (stride + cstride);
 +        format = HAL_PIXEL_FORMAT_YV12;
