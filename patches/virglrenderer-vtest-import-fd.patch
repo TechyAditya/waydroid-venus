@@ -118,7 +118,7 @@ index 1bd515c..70ac8e8 100644
 +
  #endif /* VTEST_PROTOCOL */
 diff --git a/vtest/vtest_renderer.c b/vtest/vtest_renderer.c
-index ba4feb1..d194729 100644
+index ba4feb1..1acd077 100644
 --- a/vtest/vtest_renderer.c
 +++ b/vtest/vtest_renderer.c
 @@ -44,6 +44,11 @@
@@ -133,7 +133,7 @@ index ba4feb1..d194729 100644
  #ifdef HAVE_EVENTFD_H
  #include <sys/eventfd.h>
  #endif
-@@ -3053,6 +3058,186 @@ out:
+@@ -3053,6 +3058,189 @@ out:
     return ret;
  }
  
@@ -247,14 +247,17 @@ index ba4feb1..d194729 100644
 +      }
 +   }
 +
-+   const off_t end = lseek(fd, 0, SEEK_END);
-+   if (end <= 0 || size > (uint64_t)end) {
++   /* fstat rather than lseek: a received fd shares its offset with the
++    * client's fd
++    */
++   struct stat st;
++   if (fstat(fd, &st) || st.st_size <= 0 || size > (uint64_t)st.st_size) {
 +      close(fd);
 +      report_failure("invalid dma-buf size", -EINVAL);
 +      return 0;
 +   }
 +   if (!size)
-+      size = end;
++      size = st.st_size;
 +
 +   struct vtest_resource *res = vtest_new_resource(0);
 +   if (!res) {
