@@ -136,6 +136,9 @@ struct session {
    /* frames after one the GPU rejected reference a picture that was never
     * decoded, so they are dropped until the next keyframe */
    bool await_keyframe;
+   /* AV1 only: the GPU rejected a frame while receiving, so the decoder
+    * restarts before the next keyframe */
+   bool restart_pending;
    /* AV1 only: reads each keyframe's size, with a context of its own */
    AVCodecParserContext *parser;
    AVCodecContext *parser_ctx;
@@ -446,6 +449,7 @@ receive_frames(struct session *s)
           * if it keeps failing */
          if (err == AVERROR_EXTERNAL && s->parser) {
             s->await_keyframe = true;
+            s->restart_pending = true;
             return 0;
          }
          return err;
@@ -648,10 +652,14 @@ handle_decode(struct session *s, uint32_t size)
                           AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
          int w = s->parser->width, h = s->parser->height;
          keyframe = s->parser->key_frame == 1;
-         if (keyframe && w > 0 && h > 0 && (unsigned)w <= HWDEC_MAX_DIMENSION &&
-             (unsigned)h <= HWDEC_MAX_DIMENSION && (w != s->width || h != s->height)) {
-            if (s->width && !reopen_decoder(s))
+         bool resized = keyframe && w > 0 && h > 0 && (unsigned)w <= HWDEC_MAX_DIMENSION &&
+                        (unsigned)h <= HWDEC_MAX_DIMENSION && (w != s->width || h != s->height);
+         if (keyframe && ((resized && s->width) || s->restart_pending)) {
+            s->restart_pending = false;
+            if (!reopen_decoder(s))
                return reply_simple(s, HWDEC_REPLY_ERROR);
+         }
+         if (resized) {
             s->width = w;
             s->height = h;
          }
@@ -667,7 +675,8 @@ handle_decode(struct session *s, uint32_t size)
             s->await_keyframe = true;
             if (!reopen_decoder(s))
                return reply_simple(s, HWDEC_REPLY_ERROR);
-            err = send_packet(s);
+            /* a fresh decoder can only start at a keyframe */
+            err = keyframe ? send_packet(s) : AVERROR_INVALIDDATA;
             if (err == AVERROR_EXTERNAL)
                err = AVERROR_INVALIDDATA;
          }
@@ -718,6 +727,7 @@ handle_drain(struct session *s, const struct hwdec_output *out)
    avcodec_flush_buffers(s->ctx);
    s->draining = false;
    s->await_keyframe = false;
+   s->restart_pending = false;
    s->width = s->height = 0;
    s->eof = false;
    return reply_simple(s, HWDEC_REPLY_EOS);
@@ -767,6 +777,7 @@ handle_request(struct session *s, const struct hwdec_request *req)
       avcodec_flush_buffers(s->ctx);
       s->draining = false;
       s->await_keyframe = false;
+      s->restart_pending = false;
       s->width = s->height = 0;
       s->eof = false;
       return reply_simple(s, HWDEC_REPLY_OK);
