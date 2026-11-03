@@ -549,8 +549,14 @@ handle_drain(struct session *s, const struct hwdec_output *out)
       s->eof = false;
       avcodec_send_packet(s->ctx, NULL);
    }
-   if (!s->queued && !s->eof && receive_frames(s) < 0)
-      return reply_simple(s, HWDEC_REPLY_ERROR);
+   /* Draining decoders should not ask for more input, but give one that
+    * does a moment before calling the stream broken. */
+   for (int tries = 0; !s->queued && !s->eof && tries < 100; tries++) {
+      if (receive_frames(s) < 0)
+         return reply_simple(s, HWDEC_REPLY_ERROR);
+      if (!s->queued && !s->eof)
+         usleep(1000);
+   }
    if (s->queued)
       return reply_frame(s, out);
    if (!s->eof)
@@ -669,8 +675,12 @@ accept_client(int listen_fd)
 
    struct ucred cred;
    socklen_t len = sizeof(cred);
-   if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) < 0 ||
-       cred.uid != allowed_uid) {
+   if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) < 0) {
+      log_msg("refused a connection without credentials: %s", strerror(errno));
+      close(fd);
+      return;
+   }
+   if (cred.uid != allowed_uid) {
       log_msg("refused a connection from uid %d", (int)cred.uid);
       close(fd);
       return;
