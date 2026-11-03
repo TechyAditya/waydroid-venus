@@ -1,5 +1,5 @@
 diff --git a/modules/gralloc/gralloc.cpp b/modules/gralloc/gralloc.cpp
-index 87bda97..b5c3657 100644
+index 87bda97..1bb85fe 100644
 --- a/modules/gralloc/gralloc.cpp
 +++ b/modules/gralloc/gralloc.cpp
 @@ -26,6 +26,8 @@
@@ -41,7 +41,7 @@ index 87bda97..b5c3657 100644
          }
      }
      
-@@ -195,56 +206,119 @@ static int gralloc_alloc_buffer(alloc_device_t* dev,
+@@ -195,56 +206,125 @@ static int gralloc_alloc_buffer(alloc_device_t* dev,
  
  /*****************************************************************************/
  
@@ -107,6 +107,12 @@ index 87bda97..b5c3657 100644
 +        const uint64_t cstride = align(stride / 2, 16);
 +        size = align(height, tileHeight) * (stride + cstride);
 +        format = HAL_PIXEL_FORMAT_YV12;
++    } else if (format == HAL_PIXEL_FORMAT_YCBCR_P010) {
++        // 10-bit 4:2:0: a plane of 16-bit Y samples, then interleaved Cb Cr,
++        // aligned like YV12.  The stride is in pixels.
++        tileHeight = 16;
++        stride = align(width, 128);
++        size = align(height, tileHeight) * stride * 2 * 3 / 2;
 +    } else {
 +        // Venus imports gralloc buffers as images through Mesa's fallback
 +        // gralloc, which knows only the 565, 8888, 1010102, FP16 and YUV
@@ -217,10 +223,10 @@ index 2cd1007..c5cabc0 100644
          version = sizeof(native_handle);
          numInts = sNumInts();
 diff --git a/modules/gralloc/mapper.cpp b/modules/gralloc/mapper.cpp
-index ee3e40e..69701fa 100644
+index ee3e40e..56c04e4 100644
 --- a/modules/gralloc/mapper.cpp
 +++ b/modules/gralloc/mapper.cpp
-@@ -175,6 +175,37 @@ int gralloc_lock(gralloc_module_t const* /*module*/,
+@@ -175,6 +175,51 @@ int gralloc_lock(gralloc_module_t const* /*module*/,
      return 0;
  }
  
@@ -233,12 +239,26 @@ index ee3e40e..69701fa 100644
 +        return -EINVAL;
 +
 +    private_handle_t* hnd = (private_handle_t*)handle;
-+    if (hnd->format != HAL_PIXEL_FORMAT_YV12)
++    if (hnd->format != HAL_PIXEL_FORMAT_YV12 && hnd->format != HAL_PIXEL_FORMAT_YCBCR_P010)
 +        return -EINVAL;
 +
 +    // Without CPU usage, callers such as Mesa query the plane layout and
 +    // expect the pointers to be offsets from NULL.
 +    const bool cpu = usage & (GRALLOC_USAGE_SW_READ_MASK | GRALLOC_USAGE_SW_WRITE_MASK);
++    if (hnd->format == HAL_PIXEL_FORMAT_YCBCR_P010) {
++        const size_t stride = size_t(hnd->stride) * 2;
++        const uintptr_t y = cpu ? uintptr_t(hnd->base) : 0;
++        const uintptr_t cb = y + stride * hnd->height;
++
++        memset(ycbcr, 0, sizeof(*ycbcr));
++        ycbcr->y = reinterpret_cast<void*>(y);
++        ycbcr->cb = reinterpret_cast<void*>(cb);
++        ycbcr->cr = reinterpret_cast<void*>(cb + 2);
++        ycbcr->ystride = stride;
++        ycbcr->cstride = stride;
++        ycbcr->chroma_step = 4;
++        return 0;
++    }
 +    const size_t ystride = hnd->stride;
 +    const size_t cstride = (ystride / 2 + 15) & ~size_t(15);
 +    const uintptr_t y = cpu ? uintptr_t(hnd->base) : 0;

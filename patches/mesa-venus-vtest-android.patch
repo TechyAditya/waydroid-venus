@@ -1,3 +1,25 @@
+diff --git a/src/util/u_gralloc/u_gralloc_internal.c b/src/util/u_gralloc/u_gralloc_internal.c
+index c645202..64962f2 100644
+--- a/src/util/u_gralloc/u_gralloc_internal.c
++++ b/src/util/u_gralloc/u_gralloc_internal.c
+@@ -37,6 +37,7 @@ static const struct droid_yuv_format droid_yuv_formats[] = {
+    {HAL_PIXEL_FORMAT_YCbCr_420_888, YCbCr, 1, DRM_FORMAT_YUV420},
+    {HAL_PIXEL_FORMAT_YCbCr_420_888, YCrCb, 1, DRM_FORMAT_YVU420},
+    {HAL_PIXEL_FORMAT_YV12, YCrCb, 1, DRM_FORMAT_YVU420},
++   {HAL_PIXEL_FORMAT_YCBCR_P010, YCbCr, 4, DRM_FORMAT_P010},
+    /* HACK: See droid_create_image_from_prime_fds() and
+     * https://issuetracker.google.com/32077885. */
+    {HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, YCbCr, 2, DRM_FORMAT_NV12},
+@@ -154,7 +155,8 @@ bufferinfo_from_ycbcr(const struct android_ycbcr *ycbcr,
+ 
+    out->drm_fourcc = drm_fourcc;
+ 
+-   out->num_planes = ycbcr->chroma_step == 2 ? 2 : 3;
++   /* interleaved chroma, 8-bit (NV12) or 16-bit (P010), is one plane */
++   out->num_planes = ycbcr->chroma_step == 1 ? 3 : 2;
+    /* When lock_ycbcr's usage argument contains no SW_READ/WRITE flags
+     * it will return the .y/.cb/.cr pointers based on a NULL pointer,
+     * so they can be interpreted as offsets. */
 diff --git a/src/virtio/vtest/vtest_protocol.h b/src/virtio/vtest/vtest_protocol.h
 index 1bd515c..70ac8e8 100644
 --- a/src/virtio/vtest/vtest_protocol.h
