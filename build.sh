@@ -189,7 +189,7 @@ extract() {
       exit 1
    fi
 }
-for name in libstagefright_foundation libutils libcutils liblog; do
+for name in libstagefright_foundation libhardware libutils libcutils liblog; do
    extract "$images/system.img" "/system/lib/$name.so" "$image_files/lib/$name.so"
 done
 extract "$images/vendor.img" /lib/libstagefright_softomx.so "$image_files/lib/libstagefright_softomx.so"
@@ -208,9 +208,10 @@ lineage=$build/lineage
    -I"$lineage/frameworks_native/libs/arect/include" \
    -I"$lineage/system_core/libutils/include" -I"$lineage/system_core/libcutils/include" \
    -I"$lineage/system_core/libsystem/include" -I"$lineage/system_logging/liblog/include" \
+   -I"$build/libhardware/include" \
    -o "$build/out/lib/libstagefrighthw.so" "$here/hwdec/android/WaydroidDecoder.cpp" \
-   -L"$image_files/lib" -lstagefright_softomx -lstagefright_foundation -lutils -lcutils -llog \
-   -Wl,--no-undefined
+   -L"$image_files/lib" -lstagefright_softomx -lstagefright_foundation -lhardware -lutils \
+   -lcutils -llog -Wl,--no-undefined
 "$ndk_bin/llvm-strip" "$build/out/lib/libstagefrighthw.so"
 
 mkdir -p "$build/out/etc/seccomp_policy"

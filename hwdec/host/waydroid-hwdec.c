@@ -102,8 +102,18 @@ get_device(void)
    return ref;
 }
 
+/* a gralloc buffer from Android that frames can go straight into */
+struct target {
+   struct hwdec_target layout;
+   uint8_t *map;
+   size_t size;
+};
+
 struct session {
    int fd;
+   /* the fd attached to the current request, or -1 */
+   int received_fd;
+   struct target targets[HWDEC_MAX_TARGETS];
    AVCodecContext *ctx;
    AVPacket *pkt;
    AVFrame *queue[MAX_QUEUED_FRAMES];
@@ -124,20 +134,104 @@ struct session {
    unsigned bad_packets;
 };
 
+/* Reads SIZE bytes, keeping an attached fd in s->received_fd. */
 static bool
-read_full(int fd, void *buf, size_t size)
+read_full(struct session *s, void *buf, size_t size)
 {
    uint8_t *p = buf;
    while (size) {
-      ssize_t n = read(fd, p, size);
+      union {
+         char buf[CMSG_SPACE(sizeof(int))];
+         struct cmsghdr align;
+      } control;
+      struct iovec iov = { .iov_base = p, .iov_len = size };
+      struct msghdr msg = {
+         .msg_iov = &iov,
+         .msg_iovlen = 1,
+         .msg_control = control.buf,
+         .msg_controllen = sizeof(control.buf),
+      };
+      ssize_t n = recvmsg(s->fd, &msg, MSG_CMSG_CLOEXEC);
       if (n < 0 && errno == EINTR)
          continue;
       if (n <= 0)
          return false;
+      if (msg.msg_flags & MSG_CTRUNC) {
+         log_msg("closing a connection that sent more than one fd");
+         return false;
+      }
+      for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
+         if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS)
+            continue;
+         int fd;
+         memcpy(&fd, CMSG_DATA(c), sizeof(fd));
+         if (c->cmsg_len != CMSG_LEN(sizeof(int)) || s->received_fd >= 0) {
+            close(fd);
+            return false;
+         }
+         s->received_fd = fd;
+      }
       p += n;
       size -= n;
    }
    return true;
+}
+
+static void
+unregister_targets(struct session *s)
+{
+   for (unsigned i = 0; i < HWDEC_MAX_TARGETS; i++) {
+      if (s->targets[i].map)
+         munmap(s->targets[i].map, s->targets[i].size);
+      s->targets[i].map = NULL;
+   }
+}
+
+static bool
+plane_fits(uint64_t offset, uint64_t stride, uint64_t width, uint64_t rows, uint64_t size)
+{
+   return stride >= width && offset + stride * rows <= size;
+}
+
+/* Maps the attached memfd as target LAYOUT.  Only a memfd sealed against
+ * shrinking is safe to write to: Android cannot truncate it under us. */
+static bool
+register_target(struct session *s, const struct hwdec_target *layout)
+{
+   int fd = s->received_fd;
+   s->received_fd = -1;
+   if (fd < 0)
+      return false;
+
+   bool ok = false;
+   struct stat st;
+   int seals = fcntl(fd, F_GET_SEALS);
+   uint32_t w = layout->width, h = layout->height;
+   uint32_t cw = (w + 1) / 2, ch = (h + 1) / 2;
+   if (layout->id < 1 || layout->id > HWDEC_MAX_TARGETS || !w || !h ||
+       w > HWDEC_MAX_DIMENSION || h > HWDEC_MAX_DIMENSION || seals < 0 ||
+       !(seals & F_SEAL_SHRINK) || (seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) ||
+       fstat(fd, &st) < 0 || st.st_size <= 0 || st.st_size > (1 << 30))
+      goto out;
+   size_t size = st.st_size;
+   if (!plane_fits(layout->offset[0], layout->stride[0], w, h, size) ||
+       !plane_fits(layout->offset[1], layout->stride[1], cw, ch, size) ||
+       !plane_fits(layout->offset[2], layout->stride[2], cw, ch, size))
+      goto out;
+
+   uint8_t *map = mmap(NULL, size, PROT_WRITE, MAP_SHARED, fd, 0);
+   if (map == MAP_FAILED)
+      goto out;
+   struct target *t = &s->targets[layout->id - 1];
+   if (t->map)
+      munmap(t->map, t->size);
+   t->layout = *layout;
+   t->map = map;
+   t->size = size;
+   ok = true;
+out:
+   close(fd);
+   return ok;
 }
 
 static bool
@@ -150,7 +244,8 @@ send_reply(struct session *s, struct hwdec_reply *reply)
    } control;
    struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
 
-   if (reply->type == HWDEC_REPLY_FRAME && !s->shm_sent) {
+   bool in_shm = reply->type == HWDEC_REPLY_FRAME && !(reply->flags & HWDEC_FRAME_IN_TARGET);
+   if (in_shm && !s->shm_sent) {
       reply->shm_size = s->shm_size;
       memset(&control, 0, sizeof(control));
       msg.msg_control = control.buf;
@@ -173,7 +268,7 @@ send_reply(struct session *s, struct hwdec_reply *reply)
       msg.msg_control = NULL;
       msg.msg_controllen = 0;
    }
-   if (reply->type == HWDEC_REPLY_FRAME)
+   if (in_shm)
       s->shm_sent = true;
    return true;
 }
@@ -303,8 +398,10 @@ receive_frames(struct session *s)
    return 0;
 }
 
+/* Converts the next queued frame into OUT's target, or else the shared
+ * memory, and replies with it. */
 static bool
-reply_frame(struct session *s)
+reply_frame(struct session *s, const struct hwdec_output *out)
 {
    AVFrame *frame = s->queue[0];
    memmove(s->queue, s->queue + 1, --s->queued * sizeof(s->queue[0]));
@@ -337,18 +434,38 @@ reply_frame(struct session *s)
       .matrix = frame->colorspace,
       .full_range = frame->color_range == AVCOL_RANGE_JPEG,
    };
-   reply.offset[1] = reply.stride[0] * h;
-   reply.offset[2] = reply.offset[1] + reply.stride[1] * ch;
-   size_t size = reply.offset[2] + (size_t)reply.stride[2] * ch;
-
    s->sws = sws_getCachedContext(s->sws, w, h, src->format, w, h, AV_PIX_FMT_YUV420P,
                                  SWS_BILINEAR, NULL, NULL, NULL);
-   if (!s->sws || !ensure_shm(s, size)) {
+   if (!s->sws) {
       av_frame_free(&frame);
       return reply_simple(s, HWDEC_REPLY_ERROR);
    }
-   uint8_t *dst[4] = { s->shm, s->shm + reply.offset[1], s->shm + reply.offset[2] };
-   int dst_stride[4] = { reply.stride[0], reply.stride[1], reply.stride[2] };
+
+   uint8_t *dst[4];
+   int dst_stride[4];
+   const struct target *t = NULL;
+   if (out->target >= 1 && out->target <= HWDEC_MAX_TARGETS)
+      t = &s->targets[out->target - 1];
+   if (t && t->map && w == out->width && h == out->height && w <= t->layout.width &&
+       h <= t->layout.height) {
+      for (int i = 0; i < 3; i++) {
+         dst[i] = t->map + t->layout.offset[i];
+         dst_stride[i] = t->layout.stride[i];
+      }
+      reply.flags |= HWDEC_FRAME_IN_TARGET;
+   } else {
+      reply.offset[1] = reply.stride[0] * h;
+      reply.offset[2] = reply.offset[1] + reply.stride[1] * ch;
+      size_t size = reply.offset[2] + (size_t)reply.stride[2] * ch;
+      if (!ensure_shm(s, size)) {
+         av_frame_free(&frame);
+         return reply_simple(s, HWDEC_REPLY_ERROR);
+      }
+      for (int i = 0; i < 3; i++) {
+         dst[i] = s->shm + reply.offset[i];
+         dst_stride[i] = reply.stride[i];
+      }
+   }
    sws_scale(s->sws, (const uint8_t *const *)src->data, src->linesize, 0, h, dst, dst_stride);
    av_frame_free(&frame);
    return send_reply(s, &reply);
@@ -413,14 +530,20 @@ handle_decode(struct session *s, uint32_t size)
 
    if (receive_frames(s) < 0)
       return reply_simple(s, HWDEC_REPLY_ERROR);
-   return s->queued ? reply_frame(s) : reply_simple(s, HWDEC_REPLY_NO_FRAME);
+   return s->queued ? reply_frame(s, &hdr.output) : reply_simple(s, HWDEC_REPLY_NO_FRAME);
 }
 
 static bool
-handle_drain(struct session *s)
+handle_receive(struct session *s, const struct hwdec_output *out)
 {
-   if (!s->ctx)
-      return false;
+   if (!s->queued && !s->draining && receive_frames(s) < 0)
+      return reply_simple(s, HWDEC_REPLY_ERROR);
+   return s->queued ? reply_frame(s, out) : reply_simple(s, HWDEC_REPLY_NO_FRAME);
+}
+
+static bool
+handle_drain(struct session *s, const struct hwdec_output *out)
+{
    if (!s->draining) {
       s->draining = true;
       s->eof = false;
@@ -429,7 +552,7 @@ handle_drain(struct session *s)
    if (!s->queued && !s->eof && receive_frames(s) < 0)
       return reply_simple(s, HWDEC_REPLY_ERROR);
    if (s->queued)
-      return reply_frame(s);
+      return reply_frame(s, out);
    if (!s->eof)
       return reply_simple(s, HWDEC_REPLY_ERROR);
 
@@ -457,13 +580,25 @@ handle_request(struct session *s, const struct hwdec_request *req)
    case HWDEC_REQUEST_DECODE:
       return handle_decode(s, req->size);
    case HWDEC_REQUEST_RECEIVE:
-      if (req->size || !s->ctx)
+   case HWDEC_REQUEST_DRAIN: {
+      struct hwdec_output out;
+      if (req->size != sizeof(out) || !s->ctx)
          return false;
-      if (!s->queued && !s->draining && receive_frames(s) < 0)
-         return reply_simple(s, HWDEC_REPLY_ERROR);
-      return s->queued ? reply_frame(s) : reply_simple(s, HWDEC_REPLY_NO_FRAME);
-   case HWDEC_REQUEST_DRAIN:
-      return !req->size && handle_drain(s);
+      memcpy(&out, s->payload, sizeof(out));
+      return req->type == HWDEC_REQUEST_RECEIVE ? handle_receive(s, &out) : handle_drain(s, &out);
+   }
+   case HWDEC_REQUEST_REGISTER: {
+      struct hwdec_target layout;
+      if (req->size != sizeof(layout))
+         return false;
+      memcpy(&layout, s->payload, sizeof(layout));
+      return reply_simple(s, register_target(s, &layout) ? HWDEC_REPLY_OK : HWDEC_REPLY_ERROR);
+   }
+   case HWDEC_REQUEST_UNREGISTER_ALL:
+      if (req->size)
+         return false;
+      unregister_targets(s);
+      return reply_simple(s, HWDEC_REPLY_OK);
    case HWDEC_REQUEST_FLUSH:
       if (req->size || !s->ctx)
          return false;
@@ -483,7 +618,7 @@ session_main(void *arg)
    struct session *s = arg;
    struct hwdec_request req;
 
-   while (read_full(s->fd, &req, sizeof(req))) {
+   while (read_full(s, &req, sizeof(req))) {
       if (req.size > HWDEC_MAX_PACKET_SIZE + sizeof(struct hwdec_packet))
          break;
       if (req.size > s->payload_cap) {
@@ -493,10 +628,22 @@ session_main(void *arg)
          s->payload = p;
          s->payload_cap = req.size;
       }
-      if (!read_full(s->fd, s->payload, req.size) || !handle_request(s, &req))
+      if (!read_full(s, s->payload, req.size))
          break;
+      if (!handle_request(s, &req)) {
+         log_msg("closing a connection after a bad request %u of %u bytes", req.type, req.size);
+         break;
+      }
+      /* only REGISTER takes an fd */
+      if (s->received_fd >= 0) {
+         close(s->received_fd);
+         s->received_fd = -1;
+      }
    }
 
+   if (s->received_fd >= 0)
+      close(s->received_fd);
+   unregister_targets(s);
    clear_queue(s);
    avcodec_free_context(&s->ctx);
    av_packet_free(&s->pkt);
@@ -542,6 +689,7 @@ accept_client(int listen_fd)
    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
    if (s) {
       s->fd = fd;
+      s->received_fd = -1;
       s->shm_fd = -1;
    }
    if (!s || pthread_create(&thread, &attr, session_main, s)) {

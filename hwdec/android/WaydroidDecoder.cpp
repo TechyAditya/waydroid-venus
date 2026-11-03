@@ -4,6 +4,10 @@
  * 32-bit media.codec service loads.  The components reuse the decoder
  * plumbing of Google's soft OMX decoders and only replace decoding with
  * requests to the host; see ../protocol.h.
+ *
+ * When ACodec renders to a surface, the output buffers are the surface's
+ * YV12 gralloc buffers, and the host writes frames straight into them.
+ * Otherwise frames come back in shared memory and are copied out.
  */
 #define LOG_TAG "WaydroidDecoder"
 
@@ -16,11 +20,14 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <hardware/gralloc.h>
 #include <log/log.h>
+#include <media/hardware/HardwareAPI.h>
 #include <media/hardware/OMXPluginBase.h>
 #include <media/openmax/OMX_IndexExt.h>
 #include <media/stagefright/foundation/ColorUtils.h>
 #include <media/stagefright/omx/SoftVideoDecoderOMXComponent.h>
+#include <system/graphics.h>
 
 #include "../protocol.h"
 
@@ -34,6 +41,8 @@ constexpr OMX_U32 kMinInputBufferSize = 2 << 20;
 constexpr OMX_U32 kMinCompressionRatio = 2;
 // a stuck host must not hang media.codec forever
 constexpr int kTimeoutSeconds = 5;
+constexpr OMX_COLOR_FORMATTYPE kNativeFormat = static_cast<OMX_COLOR_FORMATTYPE>(HAL_PIXEL_FORMAT_YV12);
+constexpr uint32_t kNativeUsage = GRALLOC_USAGE_SW_WRITE_OFTEN;
 
 const CodecProfileLevel kAvcProfileLevels[] = {
     {OMX_VIDEO_AVCProfileConstrainedBaseline, OMX_VIDEO_AVCLevel52},
@@ -93,6 +102,11 @@ class WaydroidDecoder : public SoftVideoDecoderOMXComponent {
                                        info.numProfileLevels, 320, 240, callbacks, appData,
                                        component) {
         initPorts(kNumBuffers, kMinInputBufferSize, kNumBuffers, info.mime, kMinCompressionRatio);
+        const hw_module_t *module;
+        if (hw_get_module(GRALLOC_HARDWARE_MODULE_ID, &module) == 0) {
+            mGralloc = reinterpret_cast<const gralloc_module_t *>(module);
+            if (!mGralloc->lock || !mGralloc->lock_ycbcr || !mGralloc->unlock) mGralloc = nullptr;
+        }
         mConnected = connectHost(info.hostCodec);
     }
 
@@ -106,18 +120,39 @@ class WaydroidDecoder : public SoftVideoDecoderOMXComponent {
         if (mFd >= 0) close(mFd);
     }
 
+    OMX_ERRORTYPE getExtensionIndex(const char *name, OMX_INDEXTYPE *index) override;
     OMX_ERRORTYPE internalGetParameter(OMX_INDEXTYPE index, OMX_PTR params) override;
+    OMX_ERRORTYPE internalSetParameter(OMX_INDEXTYPE index, const OMX_PTR params) override;
     void onQueueFilled(OMX_U32 portIndex) override;
     void onPortFlushCompleted(OMX_U32 portIndex) override;
+    void onPortEnableCompleted(OMX_U32 portIndex, bool enabled) override;
     void onReset() override;
 
     int getColorAspectPreference() override { return kPreferBitstream; }
 
   private:
+    enum {
+        kEnableNativeBuffersIndex = kDescribeHdr10PlusInfoIndex + 1,
+        kGetNativeBufferUsageIndex,
+        kUseNativeBuffer2Index,
+    };
+
+    // an output gralloc buffer the host knows about
+    struct Target {
+        buffer_handle_t handle;
+        // the host writes frames into it; otherwise they are copied in
+        bool direct;
+    };
+
     int mFd = -1;
     bool mConnected = false;
     uint8_t *mShm = nullptr;
     size_t mShmSize = 0;
+    const gralloc_module_t *mGralloc = nullptr;
+    // ACodec renders to a surface, and the output buffers are its buffers
+    bool mNativeBuffers = false;
+    // target i has host id i + 1
+    Vector<Target> mTargets;
     bool mSignalledError = false;
     // the input reached end of stream; ask the host for the remaining frames
     bool mDraining = false;
@@ -128,12 +163,17 @@ class WaydroidDecoder : public SoftVideoDecoderOMXComponent {
     hwdec_reply mHeldFrame = {};
 
     bool connectHost(uint32_t codec);
-    bool request(uint32_t type, const hwdec_packet *packet, const void *data, uint32_t size,
-                 hwdec_reply *reply);
+    bool request(uint32_t type, const void *head, uint32_t headSize, const void *data,
+                 uint32_t dataSize, int fd, hwdec_reply *reply);
     bool receiveReply(hwdec_reply *reply);
     void unmapShm();
     void signalError(const char *what);
     void resetState();
+    void clearTargets();
+    // Where the host should put the next frame, for OUTHEADER.
+    hwdec_output outputFor(OMX_BUFFERHEADERTYPE *outHeader);
+    uint32_t registerTarget(buffer_handle_t handle);
+    bool copyToGraphicBuffer(const hwdec_reply &frame, buffer_handle_t handle);
     // Returns false if the output port must reconfigure before the frame can
     // be written.
     bool outputFrame(const hwdec_reply &frame, BufferInfo *outInfo);
@@ -159,7 +199,7 @@ bool WaydroidDecoder::connectHost(uint32_t codec) {
 
     hwdec_open open = {HWDEC_VERSION, codec};
     hwdec_reply reply;
-    if (!request(HWDEC_REQUEST_OPEN, nullptr, &open, sizeof(open), &reply) ||
+    if (!request(HWDEC_REQUEST_OPEN, &open, sizeof(open), nullptr, 0, -1, &reply) ||
         reply.type != HWDEC_REPLY_OK) {
         ALOGE("the host cannot open decoder %u", codec);
         return false;
@@ -167,22 +207,44 @@ bool WaydroidDecoder::connectHost(uint32_t codec) {
     return true;
 }
 
-bool WaydroidDecoder::request(uint32_t type, const hwdec_packet *packet, const void *data,
-                              uint32_t size, hwdec_reply *reply) {
-    hwdec_request header = {type, (packet ? (uint32_t)sizeof(*packet) : 0) + size};
+// Sends HEAD and DATA as the payload of a TYPE request, with FD attached
+// unless it is -1, and waits for the reply.
+bool WaydroidDecoder::request(uint32_t type, const void *head, uint32_t headSize,
+                              const void *data, uint32_t dataSize, int fd, hwdec_reply *reply) {
+    hwdec_request header = {type, headSize + dataSize};
     iovec iov[3];
     int count = 0;
     iov[count++] = {&header, sizeof(header)};
-    if (packet) iov[count++] = {const_cast<hwdec_packet *>(packet), sizeof(*packet)};
-    if (size) iov[count++] = {const_cast<void *>(data), size};
+    if (headSize) iov[count++] = {const_cast<void *>(head), headSize};
+    if (dataSize) iov[count++] = {const_cast<void *>(data), dataSize};
+
+    union {
+        char buf[CMSG_SPACE(sizeof(int))];
+        cmsghdr align;
+    } control;
+    msghdr msg = {};
+    if (fd >= 0) {
+        memset(&control, 0, sizeof(control));
+        msg.msg_control = control.buf;
+        msg.msg_controllen = sizeof(control.buf);
+        cmsghdr *c = CMSG_FIRSTHDR(&msg);
+        c->cmsg_level = SOL_SOCKET;
+        c->cmsg_type = SCM_RIGHTS;
+        c->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(c), &fd, sizeof(int));
+    }
 
     for (int i = 0; i < count;) {
-        ssize_t n = writev(mFd, iov + i, count - i);
+        msg.msg_iov = iov + i;
+        msg.msg_iovlen = count - i;
+        ssize_t n = sendmsg(mFd, &msg, MSG_NOSIGNAL);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) {
             ALOGE("send to the host: %s", n < 0 ? strerror(errno) : "closed");
             return false;
         }
+        msg.msg_control = nullptr;
+        msg.msg_controllen = 0;
         while (i < count && (size_t)n >= iov[i].iov_len) n -= iov[i++].iov_len;
         if (i < count) {
             iov[i].iov_base = static_cast<uint8_t *>(iov[i].iov_base) + n;
@@ -253,6 +315,96 @@ void WaydroidDecoder::signalError(const char *what) {
     mSignalledError = true;
 }
 
+void WaydroidDecoder::clearTargets() {
+    if (mTargets.isEmpty()) return;
+    mTargets.clear();
+    hwdec_reply reply;
+    if (!request(HWDEC_REQUEST_UNREGISTER_ALL, nullptr, 0, nullptr, 0, -1, &reply) ||
+        reply.type != HWDEC_REPLY_OK)
+        signalError("host connection lost");
+}
+
+// Tells the host about gralloc buffer HANDLE.  Returns its id.
+uint32_t WaydroidDecoder::registerTarget(buffer_handle_t handle) {
+    Target target = {handle, false};
+    uint32_t id = mTargets.size() + 1;
+    if (id > HWDEC_MAX_TARGETS) return 0;
+
+    // the plane offsets in the buffer's fd, from where the gralloc maps it
+    hwdec_target layout = {};
+    layout.id = id;
+    layout.width = outputBufferWidth();
+    layout.height = outputBufferHeight();
+    void *base = nullptr;
+    android_ycbcr ycbcr = {};
+    bool mapped = mGralloc->lock(mGralloc, handle, kNativeUsage, 0, 0, layout.width, layout.height,
+                                 &base) == 0;
+    if (mapped) mGralloc->unlock(mGralloc, handle);
+    if (mapped && mGralloc->lock_ycbcr(mGralloc, handle, kNativeUsage, 0, 0, layout.width,
+                                       layout.height, &ycbcr) == 0) {
+        mGralloc->unlock(mGralloc, handle);
+        uint8_t *planes[3] = {static_cast<uint8_t *>(ycbcr.y), static_cast<uint8_t *>(ycbcr.cb),
+                              static_cast<uint8_t *>(ycbcr.cr)};
+        size_t strides[3] = {ycbcr.ystride, ycbcr.cstride, ycbcr.cstride};
+        bool planar = ycbcr.chroma_step == 1;
+        for (int i = 0; i < 3; i++) {
+            if (planes[i] < static_cast<uint8_t *>(base)) planar = false;
+            layout.offset[i] = planes[i] - static_cast<uint8_t *>(base);
+            layout.stride[i] = strides[i];
+        }
+        hwdec_reply reply;
+        if (planar && handle->numFds >= 1) {
+            if (!request(HWDEC_REQUEST_REGISTER, &layout, sizeof(layout), nullptr, 0,
+                         handle->data[0], &reply))
+                return 0;
+            target.direct = reply.type == HWDEC_REPLY_OK;
+        }
+    }
+    if (!target.direct) ALOGW("frames for buffer %u are copied", id);
+    mTargets.push(target);
+    return id;
+}
+
+hwdec_output WaydroidDecoder::outputFor(OMX_BUFFERHEADERTYPE *outHeader) {
+    hwdec_output out = {0, mWidth, mHeight};
+    if (!mNativeBuffers) return out;
+    auto handle = reinterpret_cast<buffer_handle_t>(outHeader->pBuffer);
+    for (size_t i = 0; i < mTargets.size(); i++) {
+        if (mTargets[i].handle == handle) {
+            if (mTargets[i].direct) out.target = i + 1;
+            return out;
+        }
+    }
+    uint32_t id = registerTarget(handle);
+    if (id && mTargets[id - 1].direct) out.target = id;
+    return out;
+}
+
+bool WaydroidDecoder::copyToGraphicBuffer(const hwdec_reply &frame, buffer_handle_t handle) {
+    android_ycbcr ycbcr = {};
+    if (mGralloc->lock_ycbcr(mGralloc, handle, kNativeUsage, 0, 0, frame.width, frame.height,
+                             &ycbcr) != 0)
+        return false;
+    uint8_t *dst[3] = {static_cast<uint8_t *>(ycbcr.y), static_cast<uint8_t *>(ycbcr.cb),
+                       static_cast<uint8_t *>(ycbcr.cr)};
+    size_t dstStride[3] = {ycbcr.ystride, ycbcr.cstride, ycbcr.cstride};
+    for (int i = 0; i < 3; i++) {
+        uint32_t w = i ? (frame.width + 1) / 2 : frame.width;
+        uint32_t h = i ? (frame.height + 1) / 2 : frame.height;
+        const uint8_t *src = mShm + frame.offset[i];
+        for (uint32_t y = 0; y < h; y++) {
+            if (ycbcr.chroma_step == 1 || i == 0) {
+                memcpy(dst[i] + y * dstStride[i], src + y * frame.stride[i], w);
+            } else {
+                for (uint32_t x = 0; x < w; x++)
+                    dst[i][y * dstStride[i] + x * ycbcr.chroma_step] = src[y * frame.stride[i] + x];
+            }
+        }
+    }
+    mGralloc->unlock(mGralloc, handle);
+    return true;
+}
+
 bool WaydroidDecoder::outputFrame(const hwdec_reply &frame, BufferInfo *outInfo) {
     ColorAspects aspects;
     ColorUtils::convertIsoColorAspectsToCodecAspects(frame.primaries, frame.transfer, frame.matrix,
@@ -263,18 +415,26 @@ bool WaydroidDecoder::outputFrame(const hwdec_reply &frame, BufferInfo *outInfo)
     }
 
     bool portWillReset = false;
-    handlePortSettingsChange(&portWillReset, frame.width, frame.height);
+    handlePortSettingsChange(&portWillReset, frame.width, frame.height, mOutputFormat);
     if (portWillReset) return false;
 
     OMX_BUFFERHEADERTYPE *outHeader = outInfo->mHeader;
     size_t size = (size_t)outputBufferWidth() * outputBufferHeight() * 3 / 2;
-    if (outHeader->nAllocLen < size) {
-        signalError("output buffer too small");
-        return true;
+    if (mNativeBuffers) {
+        auto handle = reinterpret_cast<buffer_handle_t>(outHeader->pBuffer);
+        if (!(frame.flags & HWDEC_FRAME_IN_TARGET) && !copyToGraphicBuffer(frame, handle)) {
+            signalError("cannot write to an output buffer");
+            return true;
+        }
+    } else {
+        if (outHeader->nAllocLen < size) {
+            signalError("output buffer too small");
+            return true;
+        }
+        copyYV12FrameToOutputBuffer(outHeader->pBuffer, mShm + frame.offset[0],
+                                    mShm + frame.offset[1], mShm + frame.offset[2],
+                                    frame.stride[0], frame.stride[1], frame.stride[2]);
     }
-    copyYV12FrameToOutputBuffer(outHeader->pBuffer, mShm + frame.offset[0], mShm + frame.offset[1],
-                                mShm + frame.offset[2], frame.stride[0], frame.stride[1],
-                                frame.stride[2]);
     outHeader->nOffset = 0;
     outHeader->nFilledLen = size;
     outHeader->nFlags = 0;
@@ -287,22 +447,88 @@ bool WaydroidDecoder::outputFrame(const hwdec_reply &frame, BufferInfo *outInfo)
     return true;
 }
 
+OMX_ERRORTYPE WaydroidDecoder::getExtensionIndex(const char *name, OMX_INDEXTYPE *index) {
+    if (mGralloc) {
+        if (!strcmp(name, "OMX.google.android.index.enableAndroidNativeBuffers")) {
+            *index = static_cast<OMX_INDEXTYPE>(kEnableNativeBuffersIndex);
+            return OMX_ErrorNone;
+        }
+        if (!strcmp(name, "OMX.google.android.index.getAndroidNativeBufferUsage")) {
+            *index = static_cast<OMX_INDEXTYPE>(kGetNativeBufferUsageIndex);
+            return OMX_ErrorNone;
+        }
+        // The buffer handle arrives as the buffer pointer of OMX_UseBuffer,
+        // which SimpleSoftOMXComponent already handles.
+        if (!strcmp(name, "OMX.google.android.index.useAndroidNativeBuffer2")) {
+            *index = static_cast<OMX_INDEXTYPE>(kUseNativeBuffer2Index);
+            return OMX_ErrorNone;
+        }
+    }
+    return SoftVideoDecoderOMXComponent::getExtensionIndex(name, index);
+}
+
 OMX_ERRORTYPE WaydroidDecoder::internalGetParameter(OMX_INDEXTYPE index, OMX_PTR params) {
-    // Frames come out in byte buffers, so ACodec has to copy them to the
-    // surface itself.
-    if ((int)index == OMX_IndexParamVideoAndroidRequiresSwRenderer) {
-        auto *param = static_cast<OMX_PARAM_U32TYPE *>(params);
-        if (!isValidOMXParam(param)) return OMX_ErrorBadParameter;
-        if (param->nPortIndex != kOutputPortIndex) return OMX_ErrorBadPortIndex;
-        param->nU32 = 1;
-        return OMX_ErrorNone;
+    switch ((int)index) {
+        case OMX_IndexParamVideoAndroidRequiresSwRenderer: {
+            // Without a usable gralloc, frames come out in byte buffers and
+            // ACodec copies them to the surface.
+            if (mGralloc) break;
+            auto *param = static_cast<OMX_PARAM_U32TYPE *>(params);
+            if (!isValidOMXParam(param)) return OMX_ErrorBadParameter;
+            if (param->nPortIndex != kOutputPortIndex) return OMX_ErrorBadPortIndex;
+            param->nU32 = 1;
+            return OMX_ErrorNone;
+        }
+        case kGetNativeBufferUsageIndex: {
+            auto *param = static_cast<GetAndroidNativeBufferUsageParams *>(params);
+            if (!isValidOMXParam(param)) return OMX_ErrorBadParameter;
+            if (param->nPortIndex != kOutputPortIndex) return OMX_ErrorBadPortIndex;
+            param->nUsage = kNativeUsage;
+            return OMX_ErrorNone;
+        }
+        case OMX_IndexParamVideoPortFormat: {
+            OMX_ERRORTYPE err = SoftVideoDecoderOMXComponent::internalGetParameter(index, params);
+            auto *param = static_cast<OMX_VIDEO_PARAM_PORTFORMATTYPE *>(params);
+            if (err == OMX_ErrorNone && param->nPortIndex == kOutputPortIndex && mNativeBuffers)
+                param->eColorFormat = kNativeFormat;
+            return err;
+        }
     }
     return SoftVideoDecoderOMXComponent::internalGetParameter(index, params);
 }
 
-static bool frameFits(const hwdec_reply &f, size_t shmSize) {
+OMX_ERRORTYPE WaydroidDecoder::internalSetParameter(OMX_INDEXTYPE index, const OMX_PTR params) {
+    switch ((int)index) {
+        case kEnableNativeBuffersIndex: {
+            auto *param = static_cast<const EnableAndroidNativeBuffersParams *>(params);
+            if (!isValidOMXParam(param)) return OMX_ErrorBadParameter;
+            if (param->nPortIndex != kOutputPortIndex) return OMX_ErrorBadPortIndex;
+            // ACodec passes the output color format to the surface as its HAL
+            // pixel format.
+            mNativeBuffers = param->enable;
+            mOutputFormat = mNativeBuffers ? kNativeFormat : OMX_COLOR_FormatYUV420Planar;
+            updatePortDefinitions();
+            clearTargets();
+            return OMX_ErrorNone;
+        }
+        case OMX_IndexParamVideoPortFormat: {
+            auto *param = static_cast<const OMX_VIDEO_PARAM_PORTFORMATTYPE *>(params);
+            if (!isValidOMXParam(param)) return OMX_ErrorBadParameter;
+            if (param->nPortIndex == kOutputPortIndex && mNativeBuffers) {
+                bool ok = param->eCompressionFormat == OMX_VIDEO_CodingUnused &&
+                          param->eColorFormat == kNativeFormat;
+                return ok ? OMX_ErrorNone : OMX_ErrorUnsupportedSetting;
+            }
+            break;
+        }
+    }
+    return SoftVideoDecoderOMXComponent::internalSetParameter(index, params);
+}
+
+bool frameFits(const hwdec_reply &f, size_t shmSize) {
     if (!f.width || !f.height || f.width > HWDEC_MAX_DIMENSION || f.height > HWDEC_MAX_DIMENSION)
         return false;
+    if (f.flags & HWDEC_FRAME_IN_TARGET) return true;
     uint32_t rows[3] = {f.height, (f.height + 1) / 2, (f.height + 1) / 2};
     uint32_t widths[3] = {f.width, (f.width + 1) / 2, (f.width + 1) / 2};
     for (int i = 0; i < 3; i++) {
@@ -324,11 +550,11 @@ void WaydroidDecoder::onQueueFilled(OMX_U32 /* portIndex */) {
         if (mHaveHeldFrame) {
             reply = mHeldFrame;
             mHaveHeldFrame = false;
-        } else if (mPending) {
-            if (!request(HWDEC_REQUEST_RECEIVE, nullptr, nullptr, 0, &reply))
-                return signalError("host connection lost");
-        } else if (mDraining) {
-            if (!request(HWDEC_REQUEST_DRAIN, nullptr, nullptr, 0, &reply))
+        } else if (mPending || mDraining) {
+            hwdec_output out = outputFor((*outQueue.begin())->mHeader);
+            if (mSignalledError) return;
+            uint32_t type = mPending ? HWDEC_REQUEST_RECEIVE : HWDEC_REQUEST_DRAIN;
+            if (!request(type, &out, sizeof(out), nullptr, 0, -1, &reply))
                 return signalError("host connection lost");
         } else if (!inQueue.empty()) {
             BufferInfo *inInfo = *inQueue.begin();
@@ -339,8 +565,11 @@ void WaydroidDecoder::onQueueFilled(OMX_U32 /* portIndex */) {
                 packet.timestamp = inHeader->nTimeStamp;
                 if (inHeader->nFlags & OMX_BUFFERFLAG_CODECCONFIG)
                     packet.flags |= HWDEC_PACKET_CONFIG;
-                if (!request(HWDEC_REQUEST_DECODE, &packet, inHeader->pBuffer + inHeader->nOffset,
-                             inHeader->nFilledLen, &reply))
+                packet.output = outputFor((*outQueue.begin())->mHeader);
+                if (mSignalledError) return;
+                if (!request(HWDEC_REQUEST_DECODE, &packet, sizeof(packet),
+                             inHeader->pBuffer + inHeader->nOffset, inHeader->nFilledLen, -1,
+                             &reply))
                     return signalError("host connection lost");
             } else {
                 reply = {};
@@ -357,8 +586,12 @@ void WaydroidDecoder::onQueueFilled(OMX_U32 /* portIndex */) {
         switch (reply.type) {
             case HWDEC_REPLY_FRAME:
                 mPending = reply.pending;
-                if (!mShm || !frameFits(reply, mShmSize))
+                if (!frameFits(reply, mShmSize) ||
+                    (!(reply.flags & HWDEC_FRAME_IN_TARGET) && !mShm))
                     return signalError("invalid frame from the host");
+                // The host only writes a frame of the current size into a
+                // buffer, so a frame that needs new buffers is in the shared
+                // memory and can wait there.
                 if (!outputFrame(reply, *outQueue.begin())) {
                     mHeldFrame = reply;
                     mHaveHeldFrame = true;
@@ -394,7 +627,7 @@ void WaydroidDecoder::resetState() {
     mPending = 0;
     mDraining = false;
     hwdec_reply reply;
-    if (mConnected && (!request(HWDEC_REQUEST_FLUSH, nullptr, nullptr, 0, &reply) ||
+    if (mConnected && (!request(HWDEC_REQUEST_FLUSH, nullptr, 0, nullptr, 0, -1, &reply) ||
                        reply.type != HWDEC_REPLY_OK))
         signalError("host flush failed");
 }
@@ -403,9 +636,16 @@ void WaydroidDecoder::onPortFlushCompleted(OMX_U32 portIndex) {
     if (portIndex == kOutputPortIndex) resetState();
 }
 
+void WaydroidDecoder::onPortEnableCompleted(OMX_U32 portIndex, bool enabled) {
+    SoftVideoDecoderOMXComponent::onPortEnableCompleted(portIndex, enabled);
+    // ACodec frees the buffers of a disabled port
+    if (portIndex == kOutputPortIndex && !enabled) clearTargets();
+}
+
 void WaydroidDecoder::onReset() {
     SoftVideoDecoderOMXComponent::onReset();
     mSignalledError = false;
+    clearTargets();
     resetState();
 }
 
