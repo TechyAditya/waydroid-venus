@@ -408,7 +408,11 @@ create_context(struct session *s, const AVCodec *codec)
    s->ctx->pkt_timebase = (AVRational){ 1, 1000000 };
    /* frame threads only help the CPU fallback and add latency */
    s->ctx->thread_count = s->ctx->hw_device_ctx ? 1 : 0;
-   return avcodec_open2(s->ctx, codec, NULL) == 0;
+   if (avcodec_open2(s->ctx, codec, NULL) == 0)
+      return true;
+   /* without a context, every later request closes the connection */
+   avcodec_free_context(&s->ctx);
+   return false;
 }
 
 static void
@@ -424,7 +428,6 @@ clear_queue(struct session *s)
 static int
 receive_frames(struct session *s)
 {
-   unsigned rejected = 0;
    while (s->queued < MAX_QUEUED_FRAMES) {
       AVFrame *frame = av_frame_alloc();
       if (!frame)
@@ -439,9 +442,11 @@ receive_frames(struct session *s)
          /* a corrupt frame; the decoder recovers at the next one */
          if (err == AVERROR_INVALIDDATA)
             continue;
-         if (err == AVERROR_EXTERNAL && rejected++ < MAX_QUEUED_FRAMES) {
+         /* a frame the GPU rejected; AV1's next packet restarts the decoder
+          * if it keeps failing */
+         if (err == AVERROR_EXTERNAL && s->parser) {
             s->await_keyframe = true;
-            continue;
+            return 0;
          }
          return err;
       }
@@ -630,13 +635,21 @@ handle_decode(struct session *s, uint32_t size)
       s->config_size = 0;
       s->pkt->pts = hdr.timestamp;
 
-      if (s->parser && s->ctx->hw_device_ctx) {
+      /* AV1 only: the parser reads each keyframe's size, and a restarted
+       * decoder resumes at any keyframe because AV1 repeats its sequence
+       * header there.  H.264 and HEVC carry their parameter sets out of band,
+       * so a restarted decoder would never see them again. */
+      bool keyframe = false;
+      bool hw_av1 = s->parser && s->ctx->hw_device_ctx;
+      if (hw_av1) {
          uint8_t *out;
          int out_size;
          av_parser_parse2(s->parser, s->parser_ctx, &out, &out_size, s->pkt->data, s->pkt->size,
                           AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
          int w = s->parser->width, h = s->parser->height;
-         if (s->parser->key_frame == 1 && w > 0 && h > 0 && (w != s->width || h != s->height)) {
+         keyframe = s->parser->key_frame == 1;
+         if (keyframe && w > 0 && h > 0 && (unsigned)w <= HWDEC_MAX_DIMENSION &&
+             (unsigned)h <= HWDEC_MAX_DIMENSION && (w != s->width || h != s->height)) {
             if (s->width && !reopen_decoder(s))
                return reply_simple(s, HWDEC_REPLY_ERROR);
             s->width = w;
@@ -644,15 +657,19 @@ handle_decode(struct session *s, uint32_t size)
          }
       }
 
-      int err = send_packet(s);
-      if (err == AVERROR_EXTERNAL && s->ctx->hw_device_ctx) {
-         log_msg("%s: the GPU rejected a frame; restarting the decoder", s->ctx->codec->name);
-         if (!reopen_decoder(s))
-            return reply_simple(s, HWDEC_REPLY_ERROR);
+      int err = 0;
+      /* while waiting for a keyframe, other frames reference a picture that
+       * was never decoded */
+      if (!hw_av1 || !s->await_keyframe || keyframe) {
          err = send_packet(s);
-         if (err == AVERROR_EXTERNAL) {
+         if (err == AVERROR_EXTERNAL && hw_av1) {
+            log_msg("%s: the GPU rejected a frame; restarting the decoder", s->ctx->codec->name);
             s->await_keyframe = true;
-            err = AVERROR_INVALIDDATA;
+            if (!reopen_decoder(s))
+               return reply_simple(s, HWDEC_REPLY_ERROR);
+            err = send_packet(s);
+            if (err == AVERROR_EXTERNAL)
+               err = AVERROR_INVALIDDATA;
          }
       }
       if (err == AVERROR_INVALIDDATA || err == AVERROR(EAGAIN)) {
@@ -701,6 +718,7 @@ handle_drain(struct session *s, const struct hwdec_output *out)
    avcodec_flush_buffers(s->ctx);
    s->draining = false;
    s->await_keyframe = false;
+   s->width = s->height = 0;
    s->eof = false;
    return reply_simple(s, HWDEC_REPLY_EOS);
 }
@@ -749,6 +767,7 @@ handle_request(struct session *s, const struct hwdec_request *req)
       avcodec_flush_buffers(s->ctx);
       s->draining = false;
       s->await_keyframe = false;
+      s->width = s->height = 0;
       s->eof = false;
       return reply_simple(s, HWDEC_REPLY_OK);
    default:
